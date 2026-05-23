@@ -45,9 +45,7 @@ def test_context_class_is_instantiated_and_attrs_accessible(registry: Any) -> No
 
     manager = PluginManager(
         registry=registry,
-        context_class=functools.partial(
-            _HostContext, app=sentinel_app, event_bus=sentinel_bus
-        ),
+        context_class=functools.partial(_HostContext, app=sentinel_app, event_bus=sentinel_bus),
     )
     manager.load(_Probe)
 
@@ -85,9 +83,7 @@ def test_context_class_carries_through_disable_enable_cycle(registry: Any) -> No
 
     manager = PluginManager(
         registry=registry,
-        context_class=functools.partial(
-            _HostContext, app=object(), event_bus=object()
-        ),
+        context_class=functools.partial(_HostContext, app=object(), event_bus=object()),
     )
     manager.load(_Probe)
     manager.disable("probe")
@@ -110,9 +106,7 @@ def test_context_class_works_with_async_lifecycle(registry: Any) -> None:
     async def _run() -> None:
         manager = PluginManager(
             registry=registry,
-            context_class=functools.partial(
-                _HostContext, app="the-app", event_bus="the-bus"
-            ),
+            context_class=functools.partial(_HostContext, app="the-app", event_bus="the-bus"),
         )
         await manager.aload(_AsyncProbe)
 
