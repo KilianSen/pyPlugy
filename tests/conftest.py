@@ -54,12 +54,12 @@ class FakeScheduler:
         self.started = False
         self.calls: list[tuple[str, Any]] = []
 
-    def every(self, spec: str) -> Any:
-        self.calls.append(("every", spec))
+    def every(self, interval: Any) -> Any:
+        self.calls.append(("every", interval))
         return self
 
-    def cron(self, spec: str) -> Any:
-        self.calls.append(("cron", spec))
+    def cron(self, expression: str) -> Any:
+        self.calls.append(("cron", expression))
         return self
 
     def do(self, task: Any) -> Any:

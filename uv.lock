@@ -179,6 +179,11 @@ dependencies = [
     { name = "pyhooky" },
 ]
 
+[package.optional-dependencies]
+tasks = [
+    { name = "pytasky" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pyrefly" },
@@ -192,7 +197,9 @@ dev = [
 requires-dist = [
     { name = "packaging", specifier = ">=24.0" },
     { name = "pyhooky", directory = "../pyHooky" },
+    { name = "pytasky", marker = "extra == 'tasks'", directory = "../pyTasky" },
 ]
+provides-extras = ["tasks"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -218,6 +225,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/2b/6372c7dddb326223e24a46b17efd0d4bd7b4fe22c821e523157577eed2d2/pyrefly-1.0.0-py3-none-win32.whl", hash = "sha256:aa8b5d0e47080e3202a2547b39f7a5a61d2c781c712b3b67884f745ca2c759d2", size = 12222643, upload-time = "2026-05-12T20:12:38.618Z" },
     { url = "https://files.pythonhosted.org/packages/be/ad/1d23be700b6b2ddaeb362360c7145917a8edbbf7240ae428d40541772fce/pyrefly-1.0.0-py3-none-win_amd64.whl", hash = "sha256:c8abcb0f2082e83c890375128f9cff4aa4d3f210b85eea7b3046c1ae764e77f5", size = 13146369, upload-time = "2026-05-12T20:12:41.423Z" },
     { url = "https://files.pythonhosted.org/packages/8c/38/16589134f3012fd097a10dcc85771555f1a5fb76e04b682597180743af30/pyrefly-1.0.0-py3-none-win_arm64.whl", hash = "sha256:d150fa9e40e8392832be81c3bcfc0497c146674ce4d0f8e04e1ec29e775ffb8c", size = 12538326, upload-time = "2026-05-12T20:12:43.996Z" },
+]
+
+[[package]]
+name = "pytasky"
+version = "0.1.0"
+source = { directory = "../pyTasky" }
+
+[package.metadata]
+provides-extras = ["cron"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pyrefly", specifier = ">=0.16" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "pytest-cov", specifier = ">=5.0" },
+    { name = "ruff", specifier = ">=0.6" },
 ]
 
 [[package]]

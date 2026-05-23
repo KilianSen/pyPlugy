@@ -68,12 +68,16 @@ class SchedulerProtocol(Protocol):
     Plugins use this for periodic / cron-style work. pyPlugy itself only ever
     holds the reference — the manager neither starts nor stops it; that's the
     host application's job.
+
+    ``every`` accepts whatever the concrete scheduler accepts (pyTasky's takes
+    ``float | timedelta``); ``cron`` takes a cron expression string. Typed as
+    ``Any`` so the protocol stays loose enough for stubs and mocks.
     """
 
-    def every(self, spec: str) -> Any:  # pragma: no cover
+    def every(self, interval: Any) -> Any:  # pragma: no cover
         ...
 
-    def cron(self, spec: str) -> Any:  # pragma: no cover
+    def cron(self, expression: str) -> Any:  # pragma: no cover
         ...
 
     def start(self) -> None:  # pragma: no cover

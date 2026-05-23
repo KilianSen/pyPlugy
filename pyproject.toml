@@ -24,8 +24,8 @@ dependencies = [
     "packaging>=24.0",
 ]
 
-# [project.optional-dependencies]
-# tasks = ["pytasky>=0.1.0"]  # uncomment once pyTasky (sibling) is published
+[project.optional-dependencies]
+tasks = ["pytasky>=0.1.0"]
 
 [project.urls]
 Homepage = "https://github.com/kiliansen/pyPlugy"
@@ -45,8 +45,7 @@ include = ["src/pyplugy", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.uv.sources]
 pyhooky = { path = "../pyHooky" }
-# Uncomment once pyTasky is built:
-# pytasky = { path = "../pyTasky" }
+pytasky = { path = "../pyTasky" }
 
 
 [tool.pytest.ini_options]
