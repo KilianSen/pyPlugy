@@ -61,6 +61,31 @@ class PluginContext:
     every registration in the block picks up the plugin name automatically.
     Helpers exposed here merely make that intent explicit and route through
     the manager-owned registry.
+
+    **Subclassing.** Hosts that need to attach extra surface to the context
+    (a FastAPI app, an event bus, a task queue …) should subclass and either
+    declare a matching ``__slots__`` for the new attributes or omit
+    ``__slots__`` entirely to fall back to a per-instance ``__dict__``::
+
+        class MyContext(PluginContext):
+            __slots__ = ("app", "event_bus")
+
+            def __init__(self, *args, app, event_bus, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.app = app
+                self.event_bus = event_bus
+
+    Wire the subclass into the manager via the ``context_class`` parameter,
+    typically with :func:`functools.partial` to bind host extras::
+
+        manager = PluginManager(
+            context_class=functools.partial(MyContext, app=fastapi_app, event_bus=bus)
+        )
+
+    **Mutable config.** When the manager passes a ``dict`` for ``config``,
+    :attr:`config` returns that same object — changes the host makes to it
+    (directly or via :meth:`PluginManager.update_config`) are visible to the
+    plugin without a reload.
     """
 
     __slots__ = (
@@ -84,7 +109,14 @@ class PluginContext:
     ) -> None:
         self._manifest = manifest
         self._registry = registry
-        self._config: dict[str, Any] = dict(config or {})
+        # Preserve identity when the caller already hands us a dict — the
+        # manager relies on this so live edits to ``manager._configs[name]``
+        # propagate to plugins without a reload. Foreign mappings are still
+        # copied defensively.
+        if isinstance(config, dict):
+            self._config: dict[str, Any] = config
+        else:
+            self._config = dict(config or {})
         self._tasky = tasky
         self._scheduler = scheduler
         self._tasks: list[Any] = []

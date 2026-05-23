@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pyplugy._context import PluginContext, current_context
 from pyplugy._manager import (
+    HOOK_PLUGIN_CONFIG_CHANGED,
     HOOK_PLUGIN_DISABLE,
     HOOK_PLUGIN_ENABLE,
     HOOK_PLUGIN_ERROR,
@@ -30,6 +31,7 @@ from pyplugy.exceptions import (
 )
 
 __all__ = [
+    "HOOK_PLUGIN_CONFIG_CHANGED",
     "HOOK_PLUGIN_DISABLE",
     "HOOK_PLUGIN_ENABLE",
     "HOOK_PLUGIN_ERROR",

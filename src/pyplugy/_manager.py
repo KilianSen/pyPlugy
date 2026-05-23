@@ -24,6 +24,7 @@ toggles can override them.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 from contextvars import ContextVar
@@ -50,14 +51,23 @@ from pyplugy.exceptions import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
     from pathlib import Path
     from types import ModuleType
 
     from pyplugy._tasky_protocol import SchedulerProtocol, TaskyProtocol
 
 
-__all__ = ["PluginManager", "current_manager"]
+__all__ = [
+    "HOOK_PLUGIN_CONFIG_CHANGED",
+    "HOOK_PLUGIN_DISABLE",
+    "HOOK_PLUGIN_ENABLE",
+    "HOOK_PLUGIN_ERROR",
+    "HOOK_PLUGIN_LOAD",
+    "HOOK_PLUGIN_UNLOAD",
+    "PluginManager",
+    "current_manager",
+]
 
 
 HOOK_PLUGIN_LOAD = "pyplugy:plugin:load"
@@ -65,6 +75,7 @@ HOOK_PLUGIN_UNLOAD = "pyplugy:plugin:unload"
 HOOK_PLUGIN_ENABLE = "pyplugy:plugin:enable"
 HOOK_PLUGIN_DISABLE = "pyplugy:plugin:disable"
 HOOK_PLUGIN_ERROR = "pyplugy:plugin:error"
+HOOK_PLUGIN_CONFIG_CHANGED = "pyplugy:plugin:config-changed"
 
 
 _logger = logging.getLogger("pyplugy")
@@ -86,18 +97,12 @@ def current_manager() -> PluginManager | None:
 class _Slot:
     """Internal per-plugin bookkeeping the manager keeps in its table."""
 
-    __slots__ = ("config", "ctx", "plugin", "state")
+    __slots__ = ("ctx", "plugin", "state")
 
-    def __init__(
-        self,
-        plugin: Plugin,
-        ctx: PluginContext,
-        config: Mapping[str, Any] | None,
-    ) -> None:
+    def __init__(self, plugin: Plugin, ctx: PluginContext) -> None:
         self.plugin = plugin
         self.ctx = ctx
         self.state: PluginState = PluginState.UNLOADED
-        self.config: dict[str, Any] = dict(config or {})
 
 
 class PluginManager:
@@ -113,6 +118,7 @@ class PluginManager:
 
     __slots__ = (
         "_configs",
+        "_context_class",
         "_hooks_registry",
         "_lock",
         "_plugins",
@@ -127,6 +133,7 @@ class PluginManager:
         tasky: TaskyProtocol | None = None,
         scheduler: SchedulerProtocol | None = None,
         configs: Mapping[str, Mapping[str, Any]] | None = None,
+        context_class: Callable[..., PluginContext] = PluginContext,
     ) -> None:
         self._hooks_registry: HookRegistry = registry or get_default_registry()
         self._tasky = tasky
@@ -135,6 +142,7 @@ class PluginManager:
         self._configs: dict[str, dict[str, Any]] = {
             name: dict(cfg) for name, cfg in (configs or {}).items()
         }
+        self._context_class: Callable[..., PluginContext] = context_class
         self._lock = threading.RLock()
 
     # ---------- public properties ----------
@@ -220,6 +228,57 @@ class PluginManager:
             collected.extend(scan_module(module))
         return self.load_all(collected, enable=enable)
 
+    # ---------- async loading helpers ----------
+
+    async def aload(self, target: Any, *, enable: bool = True) -> Plugin:
+        """Async variant of :meth:`load` — awaits ``async def`` lifecycle methods."""
+        plugins = self._coerce_to_plugins(target)
+        if not plugins:
+            raise PluginLoadError(f"no plugins found in target {target!r}")
+        loaded = await self.aload_all(plugins, enable=enable)
+        return loaded[0]
+
+    async def aload_all(self, plugins: list[Plugin], *, enable: bool = True) -> list[Plugin]:
+        """Async variant of :meth:`load_all`."""
+        ordered = self._plan_load(plugins)
+        for p in ordered:
+            await self._ado_load(p)
+            if enable:
+                await self._ado_enable(p)
+        return ordered
+
+    async def aload_all_from_module(
+        self, module: ModuleType, *, enable: bool = True
+    ) -> list[Plugin]:
+        """Async variant of :meth:`load_all_from_module`."""
+        return await self.aload_all(scan_module(module), enable=enable)
+
+    async def aload_entry_points(self, group: str, *, enable: bool = True) -> list[Plugin]:
+        """Async variant of :meth:`load_entry_points`."""
+        collected: list[Plugin] = []
+        for ep_name, module in iter_entry_points(group):
+            try:
+                collected.extend(scan_module(module))
+            except Exception as exc:
+                raise PluginLoadError(
+                    f"failed to scan entry point {ep_name!r} (group {group!r}): {exc}"
+                ) from exc
+        return await self.aload_all(collected, enable=enable)
+
+    async def aload_directory(
+        self,
+        path: Path,
+        *,
+        recursive: bool = False,
+        pattern: str = "*.py",
+        enable: bool = True,
+    ) -> list[Plugin]:
+        """Async variant of :meth:`load_directory`."""
+        collected: list[Plugin] = []
+        for module in iter_directory_modules(path, recursive=recursive, pattern=pattern):
+            collected.extend(scan_module(module))
+        return await self.aload_all(collected, enable=enable)
+
     # ---------- lifecycle ----------
 
     def enable(self, name: str) -> None:
@@ -258,6 +317,72 @@ class PluginManager:
             plugin = slot.plugin
         self.unload(name)
         return self.load(plugin)
+
+    async def aenable(self, name: str) -> None:
+        """Async variant of :meth:`enable`."""
+        with self._lock:
+            slot = self._require_slot(name)
+            if slot.state == PluginState.ENABLED:
+                return
+            if slot.state == PluginState.UNLOADED:
+                raise PluginError(f"plugin {name!r} is unloaded; load() it first")
+        await self._ado_enable(slot.plugin)
+
+    async def adisable(self, name: str) -> None:
+        """Async variant of :meth:`disable`."""
+        with self._lock:
+            slot = self._require_slot(name)
+            if slot.state in (PluginState.DISABLED, PluginState.LOADED):
+                return
+            if slot.state == PluginState.UNLOADED:
+                raise PluginError(f"plugin {name!r} is unloaded; load() it first")
+        await self._ado_disable(slot.plugin)
+
+    async def aunload(self, name: str) -> None:
+        """Async variant of :meth:`unload`."""
+        with self._lock:
+            slot = self._require_slot(name)
+        if slot.state == PluginState.ENABLED:
+            await self._ado_disable(slot.plugin)
+        await self._ado_unload(slot.plugin)
+
+    async def areload(self, name: str) -> Plugin:
+        """Async variant of :meth:`reload`."""
+        with self._lock:
+            slot = self._require_slot(name)
+            plugin = slot.plugin
+        await self.aunload(name)
+        return await self.aload(plugin)
+
+    # ---------- runtime config ----------
+
+    def update_config(
+        self,
+        name: str,
+        new_config: Mapping[str, Any],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Mutate a plugin's config in place so live ``ctx.config`` reflects the change.
+
+        ``replace=False`` (default) merges ``new_config`` into the existing
+        dict (``dict.update``). ``replace=True`` clears the dict first, then
+        applies ``new_config`` — useful when keys must be dropped.
+
+        Works whether or not the plugin is currently loaded. If it is loaded,
+        fires :data:`HOOK_PLUGIN_CONFIG_CHANGED` with ``(plugin, config_dict)``
+        so listeners can react. Identity of the config dict is preserved,
+        so plugins that captured a reference to ``ctx.config`` keep seeing
+        live values.
+        """
+        with self._lock:
+            cfg = self._configs.setdefault(name, {})
+            if replace:
+                cfg.clear()
+            cfg.update(new_config)
+            slot = self._plugins.get(name)
+        if slot is not None:
+            self._hooks_registry.trigger(HOOK_PLUGIN_CONFIG_CHANGED, slot.plugin, cfg)
 
     # ---------- introspection ----------
 
@@ -398,8 +523,10 @@ class PluginManager:
 
     def _build_ctx(self, plugin: Plugin) -> PluginContext:
         name = plugin.manifest.name
-        cfg = self._configs.get(name, {})
-        return PluginContext(
+        # ``setdefault`` guarantees ``ctx.config is self._configs[name]`` —
+        # which is what makes :meth:`update_config` propagate without a reload.
+        cfg = self._configs.setdefault(name, {})
+        return self._context_class(
             plugin.manifest,
             registry=self._hooks_registry,
             config=cfg,
@@ -407,17 +534,28 @@ class PluginManager:
             scheduler=self._scheduler,
         )
 
+    @staticmethod
+    def _reject_coroutine(result: Any, name: str, op: str) -> None:
+        """Sync lifecycle path — surface coroutine returns instead of silently leaking them."""
+        if inspect.iscoroutine(result):
+            result.close()
+            raise PluginLoadError(
+                f"{op} for plugin {name!r} returned a coroutine; use the async "
+                f"variant (aload/aenable/adisable/aunload) to drive async lifecycle methods."
+            )
+
     def _do_load(self, plugin: Plugin) -> None:
         name = plugin.manifest.name
         ctx = self._build_ctx(plugin)
-        slot = _Slot(plugin, ctx, ctx.config)
+        slot = _Slot(plugin, ctx)
         with self._lock:
             self._plugins[name] = slot
         token = _current_manager.set(self)
         try:
             with _activate(ctx), tag_scope(name):
                 try:
-                    plugin.on_load(ctx)
+                    result = plugin.on_load(ctx)
+                    self._reject_coroutine(result, name, "on_load")
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     self._hooks_registry.clear_tag(name)
@@ -435,7 +573,6 @@ class PluginManager:
             slot = self._require_slot(name)
             if slot.state == PluginState.ENABLED:
                 return
-        # If transitioning from DISABLED, re-run setup to re-register hooks/tasks.
         token = _current_manager.set(self)
         try:
             if slot.state == PluginState.DISABLED:
@@ -443,7 +580,8 @@ class PluginManager:
                 slot.ctx = ctx
                 with _activate(ctx), tag_scope(name):
                     try:
-                        plugin.on_load(ctx)
+                        result = plugin.on_load(ctx)
+                        self._reject_coroutine(result, name, "on_load")
                     except Exception as exc:
                         self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                         self._hooks_registry.clear_tag(name)
@@ -452,7 +590,8 @@ class PluginManager:
                         ) from exc
             with _activate(slot.ctx), tag_scope(name):
                 try:
-                    plugin.on_enable(slot.ctx)
+                    result = plugin.on_enable(slot.ctx)
+                    self._reject_coroutine(result, name, "on_enable")
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginLoadError(f"on_enable failed for plugin {name!r}: {exc}") from exc
@@ -471,14 +610,13 @@ class PluginManager:
         try:
             with _activate(slot.ctx):
                 try:
-                    plugin.on_disable(slot.ctx)
+                    result = plugin.on_disable(slot.ctx)
+                    self._reject_coroutine(result, name, "on_disable")
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginLoadError(f"on_disable failed for plugin {name!r}: {exc}") from exc
-            # Tear down all hooks tagged with the plugin's name.
             removed = self._hooks_registry.clear_tag(name)
             _logger.debug("pyplugy: disabled %r — cleared %d hook(s)", name, len(removed))
-            # Reset the context's task list — tasks are considered torn down.
             slot.ctx._tasks.clear()
             slot.state = PluginState.DISABLED
             self._hooks_registry.trigger(HOOK_PLUGIN_DISABLE, plugin)
@@ -494,7 +632,111 @@ class PluginManager:
             self._hooks_registry.trigger(HOOK_PLUGIN_UNLOAD, plugin)
             with _activate(slot.ctx):
                 try:
-                    plugin.on_unload(slot.ctx)
+                    result = plugin.on_unload(slot.ctx)
+                    self._reject_coroutine(result, name, "on_unload")
+                except Exception as exc:
+                    self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
+                    raise PluginUnloadError(f"on_unload failed for plugin {name!r}: {exc}") from exc
+            removed = self._hooks_registry.clear_tag(name)
+            _logger.debug("pyplugy: unloaded %r — cleared %d hook(s)", name, len(removed))
+            with self._lock:
+                self._plugins.pop(name, None)
+        finally:
+            _current_manager.reset(token)
+
+    # ---------- async lifecycle internals ----------
+
+    @staticmethod
+    async def _maybe_await(result: Any) -> None:
+        """Await ``result`` if it is a coroutine; otherwise treat as already-completed sync work."""
+        if inspect.iscoroutine(result):
+            await result
+
+    async def _ado_load(self, plugin: Plugin) -> None:
+        name = plugin.manifest.name
+        ctx = self._build_ctx(plugin)
+        slot = _Slot(plugin, ctx)
+        with self._lock:
+            self._plugins[name] = slot
+        token = _current_manager.set(self)
+        try:
+            with _activate(ctx), tag_scope(name):
+                try:
+                    await self._maybe_await(plugin.on_load(ctx))
+                except Exception as exc:
+                    self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
+                    self._hooks_registry.clear_tag(name)
+                    with self._lock:
+                        self._plugins.pop(name, None)
+                    raise PluginLoadError(f"on_load failed for plugin {name!r}: {exc}") from exc
+            slot.state = PluginState.LOADED
+            self._hooks_registry.trigger(HOOK_PLUGIN_LOAD, plugin)
+        finally:
+            _current_manager.reset(token)
+
+    async def _ado_enable(self, plugin: Plugin) -> None:
+        name = plugin.manifest.name
+        with self._lock:
+            slot = self._require_slot(name)
+            if slot.state == PluginState.ENABLED:
+                return
+        token = _current_manager.set(self)
+        try:
+            if slot.state == PluginState.DISABLED:
+                ctx = self._build_ctx(plugin)
+                slot.ctx = ctx
+                with _activate(ctx), tag_scope(name):
+                    try:
+                        await self._maybe_await(plugin.on_load(ctx))
+                    except Exception as exc:
+                        self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
+                        self._hooks_registry.clear_tag(name)
+                        raise PluginLoadError(
+                            f"re-load failed during enable() for {name!r}: {exc}"
+                        ) from exc
+            with _activate(slot.ctx), tag_scope(name):
+                try:
+                    await self._maybe_await(plugin.on_enable(slot.ctx))
+                except Exception as exc:
+                    self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
+                    raise PluginLoadError(f"on_enable failed for plugin {name!r}: {exc}") from exc
+            slot.state = PluginState.ENABLED
+            self._hooks_registry.trigger(HOOK_PLUGIN_ENABLE, plugin)
+        finally:
+            _current_manager.reset(token)
+
+    async def _ado_disable(self, plugin: Plugin) -> None:
+        name = plugin.manifest.name
+        with self._lock:
+            slot = self._require_slot(name)
+            if slot.state in (PluginState.DISABLED, PluginState.LOADED, PluginState.UNLOADED):
+                return
+        token = _current_manager.set(self)
+        try:
+            with _activate(slot.ctx):
+                try:
+                    await self._maybe_await(plugin.on_disable(slot.ctx))
+                except Exception as exc:
+                    self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
+                    raise PluginLoadError(f"on_disable failed for plugin {name!r}: {exc}") from exc
+            removed = self._hooks_registry.clear_tag(name)
+            _logger.debug("pyplugy: disabled %r — cleared %d hook(s)", name, len(removed))
+            slot.ctx._tasks.clear()
+            slot.state = PluginState.DISABLED
+            self._hooks_registry.trigger(HOOK_PLUGIN_DISABLE, plugin)
+        finally:
+            _current_manager.reset(token)
+
+    async def _ado_unload(self, plugin: Plugin) -> None:
+        name = plugin.manifest.name
+        with self._lock:
+            slot = self._require_slot(name)
+        token = _current_manager.set(self)
+        try:
+            self._hooks_registry.trigger(HOOK_PLUGIN_UNLOAD, plugin)
+            with _activate(slot.ctx):
+                try:
+                    await self._maybe_await(plugin.on_unload(slot.ctx))
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginUnloadError(f"on_unload failed for plugin {name!r}: {exc}") from exc

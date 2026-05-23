@@ -119,6 +119,77 @@ hook registry as the single source of truth and avoids stale half-registered
 state when a plugin mutates external resources. Plugin authors should treat
 `on_load` / `setup` as idempotent (or at least re-runnable).
 
+### Async lifecycle
+
+`on_load` / `on_enable` / `on_disable` / `on_unload` may be declared
+`async def`. Drive an async plugin through the async variants of the
+manager API — they accept the same arguments as their sync siblings:
+
+```python
+async def startup():
+    await manager.aload(MyAsyncPlugin)
+    await manager.adisable("my-plugin")
+    await manager.aenable("my-plugin")
+    await manager.aunload("my-plugin")
+```
+
+Calling the sync `manager.load(...)` on a plugin whose `on_load` is
+`async def` raises `PluginLoadError` rather than silently leaking the
+coroutine.
+
+### Persistence
+
+pyPlugy is in-memory only: it never writes plugin state to disk and never
+remembers across process restarts which plugins were enabled. The host owns
+that — persist `enabled` flags wherever you keep plugin settings, then on
+startup replay them via `manager.load(...)` followed by `manager.enable(...)`
+or `manager.disable(...)`.
+
+### Runtime config edits
+
+The dict returned by `ctx.config` is the same object the manager holds in
+its internal `_configs` table — edits the host makes propagate without a
+reload. Use `manager.update_config(name, new_config)` to do that edit
+cleanly:
+
+```python
+manager.update_config("audit", {"verbosity": "debug"})           # merge
+manager.update_config("audit", {"only": True}, replace=True)     # replace
+```
+
+`update_config` fires the `pyplugy:plugin:config-changed` listener hook
+(constant `HOOK_PLUGIN_CONFIG_CHANGED`) so plugins can react. It also
+works *before* a plugin is loaded — useful for pre-seeding config from
+host storage.
+
+### Extending `PluginContext`
+
+If a host needs to attach extras to the context plugins receive
+(`ctx.app`, `ctx.event_bus`, `ctx.task_queue`, …), subclass
+`PluginContext` and pass the subclass — typically bound via
+`functools.partial` — as `context_class`:
+
+```python
+import functools
+from pyplugy import Plugin, PluginContext, PluginManager
+
+class NovelieContext(PluginContext):
+    __slots__ = ("app", "event_bus")
+
+    def __init__(self, *args, app, event_bus, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.app = app
+        self.event_bus = event_bus
+
+manager = PluginManager(
+    context_class=functools.partial(NovelieContext, app=fastapi_app, event_bus=bus),
+)
+```
+
+The base `PluginContext` uses `__slots__`; subclasses must either declare
+their own `__slots__` for the new fields or omit `__slots__` to get a
+per-instance `__dict__`.
+
 ## Dependencies between plugins
 
 `requires` accepts a list of `"<name><specifier>"` strings (PEP 440):
@@ -165,6 +236,7 @@ The manager fires pyHooky listener hooks for every lifecycle transition:
 | `pyplugy:plugin:disable` | After disable                                        |
 | `pyplugy:plugin:unload`  | Before the plugin's hooks/tasks are torn down        |
 | `pyplugy:plugin:error`   | When any lifecycle method raises (plugin, exc)       |
+| `pyplugy:plugin:config-changed` | After `manager.update_config` mutates a loaded plugin's config |
 
 Listen with `pyhooky.on`:
 

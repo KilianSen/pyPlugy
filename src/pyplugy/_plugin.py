@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, ClassVar, overload
 from pyplugy.exceptions import PluginManifestError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from pyplugy._context import PluginContext
 
@@ -145,20 +145,26 @@ class Plugin:
         return self._manifest
 
     # ---------- lifecycle hooks (override in subclasses) ----------
+    #
+    # Each lifecycle method may be declared ``async def`` instead of ``def``.
+    # The synchronous ``PluginManager.load`` / ``enable`` / ``disable`` /
+    # ``unload`` entry points reject coroutine-returning lifecycle methods;
+    # use the async variants (``aload``/``aenable``/``adisable``/``aunload``)
+    # to drive plugins whose lifecycle is async.
 
-    def on_load(self, ctx: PluginContext) -> None:
+    def on_load(self, ctx: PluginContext) -> None | Awaitable[None]:
         """Register hooks/tasks. Called inside a ``tag_scope(self.manifest.name)`` block."""
 
-    def on_unload(self, ctx: PluginContext) -> None:
+    def on_unload(self, ctx: PluginContext) -> None | Awaitable[None]:
         """Release external resources.
 
         Hooks/tasks owned by the plugin are torn down by the manager.
         """
 
-    def on_enable(self, ctx: PluginContext) -> None:
+    def on_enable(self, ctx: PluginContext) -> None | Awaitable[None]:
         """Called when the plugin transitions DISABLED → ENABLED."""
 
-    def on_disable(self, ctx: PluginContext) -> None:
+    def on_disable(self, ctx: PluginContext) -> None | Awaitable[None]:
         """Called when the plugin transitions ENABLED → DISABLED."""
 
     def __repr__(self) -> str:
