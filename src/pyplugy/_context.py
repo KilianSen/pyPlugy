@@ -8,7 +8,7 @@ auto-tagged with the plugin's name. That auto-tagging is the central
 mechanism enabling clean unload via ``HookRegistry.clear_tag``.
 
 The task helpers on the context use the :mod:`pyplugy._tasky_protocol` so
-plugins don't need pyTasky installed at import time. When the manager has no
+plugins don't need pyWorkflowy installed at import time. When the manager has no
 ``tasky`` configured, ``ctx.task`` raises a clear :class:`RuntimeError`
 pointing at the ``pyplugy[tasks]`` extra.
 """
@@ -179,16 +179,16 @@ class PluginContext:
         """Register a task with the plugin's task scope.
 
         Requires a :mod:`pyplugy._tasky_protocol`-compatible object on the
-        manager (real pyTasky or a test stub). Without one, raises a
+        manager (real pyWorkflowy or a test stub). Without one, raises a
         :class:`RuntimeError` pointing at the ``pyplugy[tasks]`` extra.
 
         Both bare (``@ctx.task``) and parameterised (``@ctx.task(retries=3)``)
-        decorator forms work — same call shape as ``@pytasky.task``.
+        decorator forms work — same call shape as ``@pyworkflowy.task``.
         """
         if self._tasky is None:
             raise RuntimeError(
                 f"plugin {self._manifest.name!r} called ctx.task but no task backend is "
-                "configured on the manager. Install pyTasky (`pip install pyplugy[tasks]`) "
+                "configured on the manager. Install pyWorkflowy (`pip install pyplugy[tasks]`) "
                 "or pass tasky= to PluginManager(...)."
             )
 

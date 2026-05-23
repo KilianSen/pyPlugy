@@ -1,8 +1,8 @@
-"""Minimal :class:`typing.Protocol` surface describing the bits of pyTasky we use.
+"""Minimal :class:`typing.Protocol` surface describing the bits of pyWorkflowy we use.
 
-pyTasky is an optional dependency. By depending on a protocol instead of the
+pyWorkflowy is an optional dependency. By depending on a protocol instead of the
 real package we keep imports loose, tests independent, and make it trivial to
-slot in a mock during testing. Real pyTasky integration happens in a follow-up
+slot in a mock during testing. Real pyWorkflowy integration happens in a follow-up
 phase once that library is published.
 """
 
@@ -69,7 +69,7 @@ class SchedulerProtocol(Protocol):
     holds the reference — the manager neither starts nor stops it; that's the
     host application's job.
 
-    ``every`` accepts whatever the concrete scheduler accepts (pyTasky's takes
+    ``every`` accepts whatever the concrete scheduler accepts (pyWorkflowy's takes
     ``float | timedelta``); ``cron`` takes a cron expression string. Typed as
     ``Any`` so the protocol stays loose enough for stubs and mocks.
     """
@@ -89,10 +89,10 @@ class SchedulerProtocol(Protocol):
 
 @runtime_checkable
 class TaskyProtocol(Protocol):
-    """The ``pytasky`` module surface pyPlugy uses.
+    """The ``pyworkflowy`` module surface pyPlugy uses.
 
     A :class:`PluginManager` can be constructed with an explicit ``tasky=``
-    argument that satisfies this protocol — typically the real ``pytasky``
+    argument that satisfies this protocol — typically the real ``pyworkflowy``
     module, but tests pass a hand-rolled stub.
     """
 

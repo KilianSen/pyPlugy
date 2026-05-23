@@ -1,7 +1,7 @@
 # pyPlugy
 
 Plugin framework for Python that composes [pyHooky](https://github.com/kiliansen/pyHooky) for
-hook-based extension points and (optionally) [pyTasky](https://github.com/kiliansen/pyTasky)
+hook-based extension points and (optionally) [pyWorkflowy](https://github.com/kiliansen/pyWorkflowy)
 for plugin-owned background tasks.
 
 A plugin in pyPlugy is just a tagged collection of hook registrations (plus,
@@ -13,11 +13,11 @@ registrations via pyHooky's `tag_scope`, and tears them all down with one
 
 ```bash
 uv add pyplugy
-uv add 'pyplugy[tasks]'   # add pyTasky integration
+uv add 'pyplugy[tasks]'   # add pyWorkflowy integration
 ```
 
 `pyplugy` depends on `pyhooky` and `packaging`. The `[tasks]` extra pulls in
-`pytasky` — without it, `ctx.task` raises a clear error pointing at the
+`pyworkflowy` — without it, `ctx.task` raises a clear error pointing at the
 extra.
 
 ## Defining a plugin
@@ -71,7 +71,7 @@ The `PluginContext` handed to your setup / lifecycle methods exposes:
 |----------------------|-----------------------------------------------------------|
 | `ctx.hooks`          | The `pyhooky.HookRegistry` hooks land in                  |
 | `ctx.before/after/around/on/on_error/hook` | Thin auto-tagged pyHooky passthroughs |
-| `ctx.task`           | Register tasks via the manager's pyTasky backend           |
+| `ctx.task`           | Register tasks via the manager's pyWorkflowy backend           |
 | `ctx.scheduler`      | Shared scheduler for periodic tasks (`Scheduler` protocol) |
 | `ctx.config`         | Per-plugin config dict (manager-injected)                 |
 | `ctx.logger`         | `logging.Logger` named `pyplugy.<plugin-name>`            |
@@ -177,16 +177,16 @@ def announce(plugin):
     print("loaded:", plugin.manifest.name)
 ```
 
-## Integration with pyTasky (optional)
+## Integration with pyWorkflowy (optional)
 
-`ctx.task` and `ctx.scheduler` come from the manager-injected pyTasky surface:
+`ctx.task` and `ctx.scheduler` come from the manager-injected pyWorkflowy surface:
 
 ```python
-import pytasky
-from pytasky.schedule import Scheduler
+import pyworkflowy
+from pyworkflowy.schedule import Scheduler
 from pyplugy import PluginManager
 
-manager = PluginManager(tasky=pytasky, scheduler=Scheduler())
+manager = PluginManager(tasky=pyworkflowy, scheduler=Scheduler())
 
 @plugin("cron-cleanup", version="0.1.0")
 def setup(ctx):
@@ -197,7 +197,7 @@ def setup(ctx):
 
 Without a `tasky` argument, `ctx.task` raises a clear `RuntimeError`. pyPlugy
 itself only depends on a small `typing.Protocol` defined in
-`pyplugy._tasky_protocol` — so tests and apps don't need pyTasky installed.
+`pyplugy._tasky_protocol` — so tests and apps don't need pyWorkflowy installed.
 
 ## Errors
 

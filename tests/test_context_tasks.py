@@ -1,4 +1,4 @@
-"""PluginContext task wiring against the mock pyTasky protocol."""
+"""PluginContext task wiring against the mock pyWorkflowy protocol."""
 
 from __future__ import annotations
 

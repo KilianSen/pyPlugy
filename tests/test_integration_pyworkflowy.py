@@ -1,7 +1,7 @@
-"""End-to-end integration: real pyHooky + real pyTasky behind PluginManager.
+"""End-to-end integration: real pyHooky + real pyWorkflowy behind PluginManager.
 
 These tests intentionally bypass the mock TaskyProtocol used elsewhere and
-drive the actual ``pytasky`` package, proving the protocol surface pyPlugy
+drive the actual ``pyworkflowy`` package, proving the protocol surface pyPlugy
 declares matches reality.
 """
 
@@ -9,15 +9,15 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytasky
-from pytasky import Task, TaskRunner
-from pytasky.schedule import Scheduler
+import pyworkflowy
+from pyworkflowy import Task, TaskRunner
+from pyworkflowy.schedule import Scheduler
 
 from pyplugy import Plugin, PluginContext, PluginManager, plugin
 
 
-def test_plugin_registers_real_pytasky_task() -> None:
-    manager = PluginManager(tasky=pytasky)
+def test_plugin_registers_real_pyworkflowy_task() -> None:
+    manager = PluginManager(tasky=pyworkflowy)
     captured: dict[str, Task[Any]] = {}
 
     @plugin("calc", version="1.0.0")
@@ -40,7 +40,7 @@ def test_plugin_registers_real_pytasky_task() -> None:
 
 
 def test_plugin_real_task_with_retry_and_dependencies() -> None:
-    manager = PluginManager(tasky=pytasky)
+    manager = PluginManager(tasky=pyworkflowy)
     attempts: dict[str, int] = {"flaky": 0}
     captured: dict[str, Task[Any]] = {}
 
@@ -75,7 +75,7 @@ def test_plugin_real_task_with_retry_and_dependencies() -> None:
 
 def test_plugin_with_real_scheduler() -> None:
     scheduler = Scheduler()
-    manager = PluginManager(tasky=pytasky, scheduler=scheduler)
+    manager = PluginManager(tasky=pyworkflowy, scheduler=scheduler)
 
     @plugin("scheduled", version="1.0.0")
     def setup(ctx: PluginContext) -> None:
@@ -91,7 +91,7 @@ def test_plugin_with_real_scheduler() -> None:
 
 
 def test_unload_clears_plugin_tasks() -> None:
-    manager = PluginManager(tasky=pytasky)
+    manager = PluginManager(tasky=pyworkflowy)
 
     @plugin("ephemeral", version="1.0.0")
     def setup(ctx: PluginContext) -> None:
@@ -106,8 +106,8 @@ def test_unload_clears_plugin_tasks() -> None:
     assert "ephemeral" not in [info.name for info in manager.list_plugins()]
 
 
-def test_class_plugin_with_real_pytasky() -> None:
-    manager = PluginManager(tasky=pytasky)
+def test_class_plugin_with_real_pyworkflowy() -> None:
+    manager = PluginManager(tasky=pyworkflowy)
     captured: dict[str, Task[Any]] = {}
 
     class WorkerPlugin(Plugin):
@@ -132,7 +132,7 @@ def test_unload_clears_hooks_alongside_tasks() -> None:
     from pyhooky import HookRegistry
 
     registry = HookRegistry(name="integration")
-    manager = PluginManager(registry=registry, tasky=pytasky)
+    manager = PluginManager(registry=registry, tasky=pyworkflowy)
 
     @plugin("bundled", version="1.0.0")
     def setup(ctx: PluginContext) -> None:

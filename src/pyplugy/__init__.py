@@ -1,4 +1,4 @@
-"""pyPlugy — plugin framework with hooks (pyHooky) and tasks (pyTasky)."""
+"""pyPlugy — plugin framework with hooks (pyHooky) and tasks (pyWorkflowy)."""
 
 from __future__ import annotations
 

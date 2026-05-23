@@ -16,7 +16,7 @@ class FakeTaskHandle:
 
 
 class FakeTask:
-    """Minimal pyTasky-like task object satisfying :class:`TaskProtocol`."""
+    """Minimal pyWorkflowy-like task object satisfying :class:`TaskProtocol`."""
 
     def __init__(self, fn: Any, **opts: Any) -> None:
         self.fn = fn
@@ -28,7 +28,7 @@ class FakeTask:
 
 
 class FakeTasky:
-    """Stand-in for the real ``pytasky`` module, used in tests."""
+    """Stand-in for the real ``pyworkflowy`` module, used in tests."""
 
     def __init__(self) -> None:
         self.registered: list[FakeTask] = []
