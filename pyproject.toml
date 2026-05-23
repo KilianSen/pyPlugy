@@ -1,6 +1,6 @@
 [project]
 name = "pyplugy"
-version = "0.1.0"
+version = "0.2.0"
 description = "Plugin framework with hooks (pyHooky) and tasks (pyWorkflowy)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -31,6 +31,7 @@ tasks = ["pyworkflowy>=0.1.0"]
 [project.urls]
 Homepage = "https://github.com/kiliansen/pyPlugy"
 Issues = "https://github.com/kiliansen/pyPlugy/issues"
+
 
 
 
@@ -116,6 +117,7 @@ upload_to_vcs_release = true
 
 [tool.semantic_release.changelog]
 exclude_commit_patterns = ["^chore\\(release\\):"]
+
 
 
 [dependency-groups]

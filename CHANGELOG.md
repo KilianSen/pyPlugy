@@ -1,6 +1,17 @@
 # CHANGELOG
 
 
+## v0.2.0 (2026-05-23)
+
+### Features
+
+- Add async lifecycle support and runtime config updates
+  ([`08a6dbb`](https://github.com/KilianSen/pyPlugy/commit/08a6dbb3a765e9e806b2957fe4f3c8f22c33d7ab))
+
+- Add async lifecycle support and runtime config updates
+  ([`6afc4d0`](https://github.com/KilianSen/pyPlugy/commit/6afc4d0583534a1dc8a7bfe95944d68770637012))
+
+
 ## v0.1.0 (2026-05-23)
 
 ### Chores
