@@ -22,6 +22,7 @@ classifiers = [
 dependencies = [
     "pyhooky>=0.1.0",
     "packaging>=24.0",
+    "pyworkflowy>=0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -42,10 +43,6 @@ packages = ["src/pyplugy"]
 [tool.hatch.build.targets.sdist]
 include = ["src/pyplugy", "README.md", "LICENSE", "pyproject.toml"]
 
-
-[tool.uv.sources]
-pyhooky = { path = "../pyHooky" }
-pyworkflowy = { path = "../pyWorkflowy" }
 
 
 [tool.pytest.ini_options]

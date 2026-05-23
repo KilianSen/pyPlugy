@@ -154,20 +154,10 @@ wheels = [
 [[package]]
 name = "pyhooky"
 version = "0.1.0"
-source = { directory = "../pyHooky" }
-
-[package.metadata]
-requires-dist = [{ name = "pydantic", marker = "extra == 'typed'", specifier = ">=2.0" }]
-provides-extras = ["typed"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pyrefly", specifier = ">=0.16" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-    { name = "pytest-cov", specifier = ">=5.0" },
-    { name = "ruff", specifier = ">=0.6" },
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/9a/5e958acd82e03d217e7a9489b6cc537305af29c2ca10ea67df1b0fad9ed4/pyhooky-0.1.0.tar.gz", hash = "sha256:277d34f719920f001dec0b64ee9f8a3ffa37a3c5fa93081cb9e3906dc20daac4", size = 22107, upload-time = "2026-05-23T15:08:18.204Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7c/39/7d6bf415bb88044a95ec70eefca91f34b2b2476bc96dfa46e61eb7c48d8f/pyhooky-0.1.0-py3-none-any.whl", hash = "sha256:af458bf85b26cb052471937c516d63303d8e232508c7db04ab716252e45fb94e", size = 24048, upload-time = "2026-05-23T15:08:16.557Z" },
 ]
 
 [[package]]
@@ -177,6 +167,7 @@ source = { editable = "." }
 dependencies = [
     { name = "packaging" },
     { name = "pyhooky" },
+    { name = "pyworkflowy" },
 ]
 
 [package.optional-dependencies]
@@ -196,8 +187,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "packaging", specifier = ">=24.0" },
-    { name = "pyhooky", directory = "../pyHooky" },
-    { name = "pyworkflowy", marker = "extra == 'tasks'", directory = "../pyWorkflowy" },
+    { name = "pyhooky", specifier = ">=0.1.0" },
+    { name = "pyworkflowy", specifier = ">=0.1.0" },
+    { name = "pyworkflowy", marker = "extra == 'tasks'", specifier = ">=0.1.0" },
 ]
 provides-extras = ["tasks"]
 
@@ -273,18 +265,10 @@ wheels = [
 [[package]]
 name = "pyworkflowy"
 version = "0.1.0"
-source = { directory = "../pyWorkflowy" }
-
-[package.metadata]
-provides-extras = ["cron"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pyrefly", specifier = ">=0.16" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-    { name = "pytest-cov", specifier = ">=5.0" },
-    { name = "ruff", specifier = ">=0.6" },
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/50/5b/991c84cdae7124e7303947df2286a994492924aa8ffb3fe2d53e7a560c2e/pyworkflowy-0.1.0.tar.gz", hash = "sha256:b0c2b8c55a8f015d4749f4d37ef6418559a134f522fa5ae77fe6daafa4a4b486", size = 29767, upload-time = "2026-05-23T16:10:20.81Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/26/19e0ff1372a744a81f8d9e4a7460b1c866e44db79a7bc21621e461d6e248/pyworkflowy-0.1.0-py3-none-any.whl", hash = "sha256:a3742bf1795f008612540ad2eae3a57f1979a2d88577093dc66db3dcf6018c35", size = 35237, upload-time = "2026-05-23T16:10:19.641Z" },
 ]
 
 [[package]]
