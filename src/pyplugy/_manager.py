@@ -379,9 +379,7 @@ class PluginManager:
             for p in plugins:
                 name = p.manifest.name
                 if name in already:
-                    raise PluginAlreadyLoadedError(
-                        f"plugin {name!r} is already loaded"
-                    )
+                    raise PluginAlreadyLoadedError(f"plugin {name!r} is already loaded")
                 if name in seen:
                     raise PluginAlreadyLoadedError(
                         f"plugin {name!r} appears twice in the load batch"
@@ -425,9 +423,7 @@ class PluginManager:
                     self._hooks_registry.clear_tag(name)
                     with self._lock:
                         self._plugins.pop(name, None)
-                    raise PluginLoadError(
-                        f"on_load failed for plugin {name!r}: {exc}"
-                    ) from exc
+                    raise PluginLoadError(f"on_load failed for plugin {name!r}: {exc}") from exc
             slot.state = PluginState.LOADED
             self._hooks_registry.trigger(HOOK_PLUGIN_LOAD, plugin)
         finally:
@@ -459,9 +455,7 @@ class PluginManager:
                     plugin.on_enable(slot.ctx)
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
-                    raise PluginLoadError(
-                        f"on_enable failed for plugin {name!r}: {exc}"
-                    ) from exc
+                    raise PluginLoadError(f"on_enable failed for plugin {name!r}: {exc}") from exc
             slot.state = PluginState.ENABLED
             self._hooks_registry.trigger(HOOK_PLUGIN_ENABLE, plugin)
         finally:
@@ -480,14 +474,10 @@ class PluginManager:
                     plugin.on_disable(slot.ctx)
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
-                    raise PluginLoadError(
-                        f"on_disable failed for plugin {name!r}: {exc}"
-                    ) from exc
+                    raise PluginLoadError(f"on_disable failed for plugin {name!r}: {exc}") from exc
             # Tear down all hooks tagged with the plugin's name.
             removed = self._hooks_registry.clear_tag(name)
-            _logger.debug(
-                "pyplugy: disabled %r — cleared %d hook(s)", name, len(removed)
-            )
+            _logger.debug("pyplugy: disabled %r — cleared %d hook(s)", name, len(removed))
             # Reset the context's task list — tasks are considered torn down.
             slot.ctx._tasks.clear()
             slot.state = PluginState.DISABLED
@@ -507,13 +497,9 @@ class PluginManager:
                     plugin.on_unload(slot.ctx)
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
-                    raise PluginUnloadError(
-                        f"on_unload failed for plugin {name!r}: {exc}"
-                    ) from exc
+                    raise PluginUnloadError(f"on_unload failed for plugin {name!r}: {exc}") from exc
             removed = self._hooks_registry.clear_tag(name)
-            _logger.debug(
-                "pyplugy: unloaded %r — cleared %d hook(s)", name, len(removed)
-            )
+            _logger.debug("pyplugy: unloaded %r — cleared %d hook(s)", name, len(removed))
             with self._lock:
                 self._plugins.pop(name, None)
         finally:

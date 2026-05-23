@@ -22,25 +22,29 @@ def test_load_directory_picks_up_plugin_files(manager: PluginManager) -> None:
 
 def test_load_directory_with_pattern(tmp_path: Path, manager: PluginManager) -> None:
     p1 = tmp_path / "alpha.py"
-    p1.write_text(textwrap.dedent(
-        """
+    p1.write_text(
+        textwrap.dedent(
+            """
         from pyplugy import plugin
 
         @plugin("alpha", version="1.0.0")
         def setup(ctx):
             pass
         """
-    ))
+        )
+    )
     p2 = tmp_path / "beta.py"
-    p2.write_text(textwrap.dedent(
-        """
+    p2.write_text(
+        textwrap.dedent(
+            """
         from pyplugy import plugin
 
         @plugin("beta", version="1.0.0")
         def setup(ctx):
             pass
         """
-    ))
+        )
+    )
 
     loaded = manager.load_directory(tmp_path)
     names = {p.manifest.name for p in loaded}
@@ -50,15 +54,17 @@ def test_load_directory_with_pattern(tmp_path: Path, manager: PluginManager) -> 
 def test_load_directory_recursive(tmp_path: Path, manager: PluginManager) -> None:
     sub = tmp_path / "sub"
     sub.mkdir()
-    (sub / "inner.py").write_text(textwrap.dedent(
-        """
+    (sub / "inner.py").write_text(
+        textwrap.dedent(
+            """
         from pyplugy import plugin
 
         @plugin("inner", version="1.0.0")
         def setup(ctx):
             pass
         """
-    ))
+        )
+    )
 
     loaded = manager.load_directory(tmp_path, recursive=True)
     assert any(p.manifest.name == "inner" for p in loaded)

@@ -54,8 +54,9 @@ class TaskProtocol(Protocol):
 class TaskRunnerProtocol(Protocol):
     """The optional batch runner. pyPlugy does not require this surface."""
 
-    def submit(self, task: TaskProtocol, *args: Any, **kwargs: Any) -> TaskHandleProtocol:
-        ...  # pragma: no cover
+    def submit(
+        self, task: TaskProtocol, *args: Any, **kwargs: Any
+    ) -> TaskHandleProtocol: ...  # pragma: no cover
 
     def run(self) -> dict[str, Any]:  # pragma: no cover
         ...

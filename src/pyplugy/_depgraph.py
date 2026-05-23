@@ -46,7 +46,7 @@ def parse_requirement(req: str) -> tuple[str, SpecifierSet]:
     if match is None:
         return req.strip(), SpecifierSet()
     name = req[: match.start()].strip()
-    spec_str = req[match.start():].strip()
+    spec_str = req[match.start() :].strip()
     if not name:
         raise PluginDependencyError(f"requirement {req!r} has no plugin name before the specifier")
     try:
@@ -131,7 +131,5 @@ def resolve_load_order(plugins: Iterable[Plugin]) -> list[Plugin]:
 
     if len(ordered) != len(plugins_list):
         cycle = sorted(n for n, deps in incoming.items() if deps)
-        raise PluginDependencyError(
-            f"cyclic plugin dependency involving: {', '.join(cycle)}"
-        )
+        raise PluginDependencyError(f"cyclic plugin dependency involving: {', '.join(cycle)}")
     return ordered

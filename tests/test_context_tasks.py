@@ -11,6 +11,7 @@ def test_ctx_task_without_tasky_raises(manager: PluginManager) -> None:
     @plugin("notasks", version="1.0.0")
     def setup(ctx: PluginContext) -> None:
         with pytest.raises(RuntimeError, match="pyplugy\\[tasks\\]"):
+
             @ctx.task
             def t() -> None:
                 pass

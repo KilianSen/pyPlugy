@@ -163,9 +163,7 @@ class PluginContext:
         # Bare callable form — `@ctx.hook` directly on a function. The bare
         # overload of `pyhooky.hook` doesn't accept registry=, so wrap it.
         if callable(target) and not isinstance(target, str) and fn is None and not kwargs:
-            wrapped = self._registry.wrap(
-                getattr(target, "__name__", None) or repr(target), target
-            )
+            wrapped = self._registry.wrap(getattr(target, "__name__", None) or repr(target), target)
             return wrapped
         if target is None and fn is None:
             return _hook(registry=self._registry, **kwargs)

@@ -89,9 +89,7 @@ def _coerce_manifest(
     tags: tuple[str, ...] | list[str] | None = None,
 ) -> PluginManifest:
     if not isinstance(name, str) or not name:
-        raise PluginManifestError(
-            f"plugin name must be a non-empty string, got {name!r}"
-        )
+        raise PluginManifestError(f"plugin name must be a non-empty string, got {name!r}")
     return PluginManifest(
         name=name,
         version=version,
@@ -221,8 +219,8 @@ def plugin(
     """
 
     def _build(setup: Callable[[PluginContext], None], inferred_name: str | None = None) -> Plugin:
-        resolved_name = inferred_name if inferred_name is not None else (
-            name if isinstance(name, str) else ""
+        resolved_name = (
+            inferred_name if inferred_name is not None else (name if isinstance(name, str) else "")
         )
         manifest = _coerce_manifest(
             resolved_name,

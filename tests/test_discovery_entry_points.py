@@ -36,9 +36,7 @@ def _patch_entry_points(
     def fake_entry_points(*, group: str | None = None) -> list[_FakeEntryPoint]:
         return list(eps)
 
-    monkeypatch.setattr(
-        "pyplugy._discovery.importlib.metadata.entry_points", fake_entry_points
-    )
+    monkeypatch.setattr("pyplugy._discovery.importlib.metadata.entry_points", fake_entry_points)
 
 
 def test_iter_entry_points_yields_module_per_ep(monkeypatch: pytest.MonkeyPatch) -> None:
