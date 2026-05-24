@@ -600,10 +600,9 @@ class PluginManager:
             if replace:
                 cfg.clear()
             cfg.update(new_config)
-            model_type = slot.plugin.config_model if slot is not None else None
-            if model_type is not None:
+            if slot is not None and slot.plugin.config_model is not None:
                 try:
-                    validated = _validate_against_model(cfg, model_type)
+                    validated = _validate_against_model(cfg, slot.plugin.config_model)
                 except PluginManifestError as exc:
                     cfg.clear()
                     cfg.update(snapshot)

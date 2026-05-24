@@ -291,7 +291,7 @@ class _DecoratedPlugin(Plugin):
 
 
 @overload
-def plugin(name: Callable[[PluginContext], None], /) -> Plugin: ...
+def plugin(name: Callable[..., None], /) -> Plugin: ...
 @overload
 def plugin(
     name: str,
@@ -304,7 +304,7 @@ def plugin(
     description: str = ...,
     author: str = ...,
     tags: tuple[str, ...] | list[str] | None = ...,
-) -> Callable[[Callable[[PluginContext], None]], Plugin]: ...
+) -> Callable[[Callable[..., None]], Plugin]: ...
 def plugin(
     name: str | Callable[[PluginContext], None],
     *,

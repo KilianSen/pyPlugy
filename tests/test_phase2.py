@@ -30,7 +30,7 @@ def test_manifest_is_basemodel() -> None:
 def test_manifest_frozen() -> None:
     m = PluginManifest(name="x")
     with pytest.raises(Exception):  # noqa: B017 - frozen raises ValidationError
-        m.name = "y"
+        m.name = "y"  # type: ignore[misc]
 
 
 def test_manifest_extra_forbidden() -> None:
@@ -245,7 +245,9 @@ def test_config_model_validates_on_load() -> None:
         config_model = CFG
 
         def on_load(self, ctx: PluginContext) -> None:
-            assert ctx.config_model.secret == "abc"
+            cfg = ctx.config_model
+            assert cfg is not None
+            assert cfg.secret == "abc"
 
     from pyhooky import HookRegistry
 

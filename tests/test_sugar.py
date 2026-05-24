@@ -199,7 +199,7 @@ def test_injection_class_form(manager: PluginManager) -> None:
         version = "1.0.0"
         requires = ("i_auth",)
 
-        def on_load(self, ctx: PluginContext, i_auth: _AuthAPI) -> None:
+        def on_load(self, ctx: PluginContext, i_auth: _AuthAPI) -> None:  # type: ignore[override]
             received["api"] = i_auth
 
     manager.load_all([Auth(), Users()])
