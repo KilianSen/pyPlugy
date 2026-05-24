@@ -32,20 +32,23 @@ from typing import TYPE_CHECKING, Any
 
 from pyhooky import HookRegistry, get_default_registry, tag_scope
 
-from pyplugy._context import PluginContext, _activate
-from pyplugy._depgraph import resolve_load_order
+from pyplugy._context import PluginContext, _activate, _validate_against_model
+from pyplugy._depgraph import compute_reverse_graph, parse_requirement, resolve_load_order
 from pyplugy._discovery import (
     import_file,
     iter_directory_modules,
     iter_entry_points,
     scan_module,
 )
-from pyplugy._plugin import Plugin, PluginInfo, PluginState, _info_for
+from pyplugy._plugin import Plugin, PluginInfo, PluginState, _DecoratedPlugin, _info_for
 from pyplugy.exceptions import (
     PluginAlreadyLoadedError,
+    PluginConfigValidationError,
     PluginDependencyError,
     PluginError,
     PluginLoadError,
+    PluginManifestError,
+    PluginMissingDependencyError,
     PluginNotFoundError,
     PluginUnloadError,
 )
@@ -56,6 +59,8 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     from pyplugy._tasky_protocol import SchedulerProtocol, TaskyProtocol
+
+    PluginResolver = Callable[[str], "list[Plugin] | None"]
 
 
 __all__ = [
@@ -94,15 +99,51 @@ def current_manager() -> PluginManager | None:
     return _current_manager.get()
 
 
+def _build_injection_kwargs(
+    plugin: Plugin, callable_obj: Any, ctx: PluginContext
+) -> dict[str, Any]:
+    """Match callable parameter names to declared deps; build the inject kwargs."""
+    try:
+        sig = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return {}
+    params = list(sig.parameters.values())
+    # Drop ``self`` if it shows up unbound (bound methods already omit it).
+    if params and params[0].name == "self":
+        params = params[1:]
+    # Drop the leading ``ctx`` positional — that's what we already pass.
+    if not params:
+        return {}
+    params = params[1:]
+    if not params:
+        return {}
+    declared = {
+        parse_requirement(r)[0]
+        for r in (
+            *plugin.manifest.requires,
+            *plugin.manifest.optional_requires,
+            *plugin.manifest.peer_requires,
+        )
+    }
+    kwargs: dict[str, Any] = {}
+    for p in params:
+        if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        if p.name in declared:
+            kwargs[p.name] = ctx.api_of(p.name)
+    return kwargs
+
+
 class _Slot:
     """Internal per-plugin bookkeeping the manager keeps in its table."""
 
-    __slots__ = ("ctx", "plugin", "state")
+    __slots__ = ("api", "ctx", "plugin", "state")
 
     def __init__(self, plugin: Plugin, ctx: PluginContext) -> None:
         self.plugin = plugin
         self.ctx = ctx
         self.state: PluginState = PluginState.UNLOADED
+        self.api: Any = None
 
 
 class PluginManager:
@@ -122,6 +163,8 @@ class PluginManager:
         "_hooks_registry",
         "_lock",
         "_plugins",
+        "_resolver_max_rounds",
+        "_resolvers",
         "_scheduler",
         "_tasky",
     )
@@ -134,6 +177,7 @@ class PluginManager:
         scheduler: SchedulerProtocol | None = None,
         configs: Mapping[str, Mapping[str, Any]] | None = None,
         context_class: Callable[..., PluginContext] = PluginContext,
+        resolver_max_rounds: int = 10,
     ) -> None:
         self._hooks_registry: HookRegistry = registry or get_default_registry()
         self._tasky = tasky
@@ -144,6 +188,8 @@ class PluginManager:
         }
         self._context_class: Callable[..., PluginContext] = context_class
         self._lock = threading.RLock()
+        self._resolvers: list[PluginResolver] = []
+        self._resolver_max_rounds = resolver_max_rounds
 
     # ---------- public properties ----------
 
@@ -291,32 +337,96 @@ class PluginManager:
                 raise PluginError(f"plugin {name!r} is unloaded; load() it first")
         self._do_enable(slot.plugin)
 
-    def disable(self, name: str) -> None:
-        """Transition an ENABLED plugin to DISABLED by tearing down its hooks/tasks."""
+    def disable(self, name: str, *, cascade: bool = False) -> None:
+        """Transition an ENABLED plugin to DISABLED by tearing down its hooks/tasks.
+
+        Raises :class:`PluginDependencyError` if other enabled plugins
+        hard-require ``name``, unless ``cascade=True``. When cascading,
+        enabled dependents are disabled in reverse-dependency order
+        before ``name``.
+        """
         with self._lock:
             slot = self._require_slot(name)
             if slot.state in (PluginState.DISABLED, PluginState.LOADED):
                 return
             if slot.state == PluginState.UNLOADED:
                 raise PluginError(f"plugin {name!r} is unloaded; load() it first")
+        enabled_dependents = self._enabled_dependents(name)
+        if enabled_dependents and not cascade:
+            raise PluginDependencyError(
+                f"cannot disable {name!r}: enabled dependents "
+                f"{sorted(enabled_dependents)}; pass cascade=True to disable them too"
+            )
+        if cascade:
+            for dep_name in self._cascade_closure(name):
+                if self._plugins[dep_name].state == PluginState.ENABLED:
+                    self._do_disable(self._plugins[dep_name].plugin)
         self._do_disable(slot.plugin)
 
-    def unload(self, name: str) -> None:
-        """Fully unload a plugin: tear down hooks/tasks, run ``on_unload``, drop the slot."""
+    def unload(self, name: str, *, cascade: bool = False) -> None:
+        """Fully unload a plugin: tear down hooks/tasks, run ``on_unload``, drop the slot.
+
+        Raises :class:`PluginDependencyError` if other plugins hard-require
+        ``name`` and are still loaded, unless ``cascade=True``. When
+        cascading, dependents are disabled+unloaded in reverse-dependency
+        order before ``name``.
+        """
         with self._lock:
             slot = self._require_slot(name)
+        dependents = self._active_dependents(name)
+        if dependents and not cascade:
+            raise PluginDependencyError(
+                f"cannot unload {name!r}: dependents {sorted(dependents)} still loaded; "
+                "pass cascade=True to unload them too"
+            )
+        if cascade:
+            for dep_name in self._cascade_closure(name):
+                dep_slot = self._plugins[dep_name]
+                if dep_slot.state == PluginState.ENABLED:
+                    self._do_disable(dep_slot.plugin)
+                self._do_unload(dep_slot.plugin)
         # Disable first if currently enabled — keeps ``on_disable`` semantics tight.
         if slot.state == PluginState.ENABLED:
             self._do_disable(slot.plugin)
         self._do_unload(slot.plugin)
 
-    def reload(self, name: str) -> Plugin:
-        """Convenience: :meth:`unload` then :meth:`load` the same :class:`Plugin` instance."""
+    def reload(self, name: str, *, cascade: bool = True) -> Plugin:
+        """Unload then re-load the same :class:`Plugin` instance.
+
+        When dependents exist, ``cascade=True`` (the default) tears them
+        down before ``name`` and reloads them afterwards, restoring the
+        prior enabled/disabled state. ``cascade=False`` raises if any
+        plugin still depends on ``name``.
+        """
         with self._lock:
             slot = self._require_slot(name)
             plugin = slot.plugin
-        self.unload(name)
-        return self.load(plugin)
+        dependents = self._active_dependents(name)
+        if dependents and not cascade:
+            raise PluginDependencyError(
+                f"cannot reload {name!r}: dependents {sorted(dependents)} still loaded; "
+                "pass cascade=True (the default) to reload them too"
+            )
+        closure = self._cascade_closure(name) if cascade else []
+        # Snapshot the plugins + their enabled status before we tear anything down.
+        closure_plugins = [self._plugins[n].plugin for n in closure]
+        was_enabled = {n: self._plugins[n].state == PluginState.ENABLED for n in closure}
+        for dep_name in closure:
+            dep_slot = self._plugins[dep_name]
+            if dep_slot.state == PluginState.ENABLED:
+                self._do_disable(dep_slot.plugin)
+            self._do_unload(dep_slot.plugin)
+        if slot.state == PluginState.ENABLED:
+            self._do_disable(slot.plugin)
+        self._do_unload(slot.plugin)
+        self._do_load(plugin)
+        self._do_enable(plugin)
+        # ``closure`` is consumers-first; reverse to load deepest deps first.
+        for dep_plugin in reversed(closure_plugins):
+            self._do_load(dep_plugin)
+            if was_enabled[dep_plugin.manifest.name]:
+                self._do_enable(dep_plugin)
+        return plugin
 
     async def aenable(self, name: str) -> None:
         """Async variant of :meth:`enable`."""
@@ -328,7 +438,7 @@ class PluginManager:
                 raise PluginError(f"plugin {name!r} is unloaded; load() it first")
         await self._ado_enable(slot.plugin)
 
-    async def adisable(self, name: str) -> None:
+    async def adisable(self, name: str, *, cascade: bool = False) -> None:
         """Async variant of :meth:`disable`."""
         with self._lock:
             slot = self._require_slot(name)
@@ -336,23 +446,130 @@ class PluginManager:
                 return
             if slot.state == PluginState.UNLOADED:
                 raise PluginError(f"plugin {name!r} is unloaded; load() it first")
+        enabled_dependents = self._enabled_dependents(name)
+        if enabled_dependents and not cascade:
+            raise PluginDependencyError(
+                f"cannot disable {name!r}: enabled dependents "
+                f"{sorted(enabled_dependents)}; pass cascade=True to disable them too"
+            )
+        if cascade:
+            for dep_name in self._cascade_closure(name):
+                if self._plugins[dep_name].state == PluginState.ENABLED:
+                    await self._ado_disable(self._plugins[dep_name].plugin)
         await self._ado_disable(slot.plugin)
 
-    async def aunload(self, name: str) -> None:
+    async def aunload(self, name: str, *, cascade: bool = False) -> None:
         """Async variant of :meth:`unload`."""
         with self._lock:
             slot = self._require_slot(name)
+        dependents = self._active_dependents(name)
+        if dependents and not cascade:
+            raise PluginDependencyError(
+                f"cannot unload {name!r}: dependents {sorted(dependents)} still loaded; "
+                "pass cascade=True to unload them too"
+            )
+        if cascade:
+            for dep_name in self._cascade_closure(name):
+                dep_slot = self._plugins[dep_name]
+                if dep_slot.state == PluginState.ENABLED:
+                    await self._ado_disable(dep_slot.plugin)
+                await self._ado_unload(dep_slot.plugin)
         if slot.state == PluginState.ENABLED:
             await self._ado_disable(slot.plugin)
         await self._ado_unload(slot.plugin)
 
-    async def areload(self, name: str) -> Plugin:
+    def swap(self, name: str, new_plugin: Plugin) -> Plugin:
+        """Replace a loaded plugin's instance with ``new_plugin``.
+
+        Both plugins must share the same ``manifest.name``. The active
+        dependents (hard + peer) are torn down and reloaded around the
+        swap, restoring their prior enabled/disabled state. Versions may
+        differ — the resolved order is re-validated against the new
+        manifest's ``requires``.
+        """
+        if new_plugin.manifest.name != name:
+            raise PluginError(
+                f"swap target {name!r} != new plugin's name {new_plugin.manifest.name!r}; "
+                "swap cannot rename"
+            )
+        with self._lock:
+            slot = self._require_slot(name)
+        closure = self._cascade_closure(name)
+        closure_plugins = [self._plugins[n].plugin for n in closure]
+        was_enabled = {n: self._plugins[n].state == PluginState.ENABLED for n in closure}
+        for dep_name in closure:
+            dep_slot = self._plugins[dep_name]
+            if dep_slot.state == PluginState.ENABLED:
+                self._do_disable(dep_slot.plugin)
+            self._do_unload(dep_slot.plugin)
+        if slot.state == PluginState.ENABLED:
+            self._do_disable(slot.plugin)
+        self._do_unload(slot.plugin)
+        self._do_load(new_plugin)
+        self._do_enable(new_plugin)
+        for dep_plugin in reversed(closure_plugins):
+            self._do_load(dep_plugin)
+            if was_enabled[dep_plugin.manifest.name]:
+                self._do_enable(dep_plugin)
+        return new_plugin
+
+    async def aswap(self, name: str, new_plugin: Plugin) -> Plugin:
+        """Async variant of :meth:`swap`."""
+        if new_plugin.manifest.name != name:
+            raise PluginError(
+                f"swap target {name!r} != new plugin's name {new_plugin.manifest.name!r}; "
+                "swap cannot rename"
+            )
+        with self._lock:
+            slot = self._require_slot(name)
+        closure = self._cascade_closure(name)
+        closure_plugins = [self._plugins[n].plugin for n in closure]
+        was_enabled = {n: self._plugins[n].state == PluginState.ENABLED for n in closure}
+        for dep_name in closure:
+            dep_slot = self._plugins[dep_name]
+            if dep_slot.state == PluginState.ENABLED:
+                await self._ado_disable(dep_slot.plugin)
+            await self._ado_unload(dep_slot.plugin)
+        if slot.state == PluginState.ENABLED:
+            await self._ado_disable(slot.plugin)
+        await self._ado_unload(slot.plugin)
+        await self._ado_load(new_plugin)
+        await self._ado_enable(new_plugin)
+        for dep_plugin in reversed(closure_plugins):
+            await self._ado_load(dep_plugin)
+            if was_enabled[dep_plugin.manifest.name]:
+                await self._ado_enable(dep_plugin)
+        return new_plugin
+
+    async def areload(self, name: str, *, cascade: bool = True) -> Plugin:
         """Async variant of :meth:`reload`."""
         with self._lock:
             slot = self._require_slot(name)
             plugin = slot.plugin
-        await self.aunload(name)
-        return await self.aload(plugin)
+        dependents = self._active_dependents(name)
+        if dependents and not cascade:
+            raise PluginDependencyError(
+                f"cannot reload {name!r}: dependents {sorted(dependents)} still loaded; "
+                "pass cascade=True (the default) to reload them too"
+            )
+        closure = self._cascade_closure(name) if cascade else []
+        closure_plugins = [self._plugins[n].plugin for n in closure]
+        was_enabled = {n: self._plugins[n].state == PluginState.ENABLED for n in closure}
+        for dep_name in closure:
+            dep_slot = self._plugins[dep_name]
+            if dep_slot.state == PluginState.ENABLED:
+                await self._ado_disable(dep_slot.plugin)
+            await self._ado_unload(dep_slot.plugin)
+        if slot.state == PluginState.ENABLED:
+            await self._ado_disable(slot.plugin)
+        await self._ado_unload(slot.plugin)
+        await self._ado_load(plugin)
+        await self._ado_enable(plugin)
+        for dep_plugin in reversed(closure_plugins):
+            await self._ado_load(dep_plugin)
+            if was_enabled[dep_plugin.manifest.name]:
+                await self._ado_enable(dep_plugin)
+        return plugin
 
     # ---------- runtime config ----------
 
@@ -377,10 +594,23 @@ class PluginManager:
         """
         with self._lock:
             cfg = self._configs.setdefault(name, {})
+            slot = self._plugins.get(name)
+            # Snapshot so we can roll back if validation rejects the new state.
+            snapshot = dict(cfg)
             if replace:
                 cfg.clear()
             cfg.update(new_config)
-            slot = self._plugins.get(name)
+            model_type = slot.plugin.config_model if slot is not None else None
+            if model_type is not None:
+                try:
+                    validated = _validate_against_model(cfg, model_type)
+                except PluginManifestError as exc:
+                    cfg.clear()
+                    cfg.update(snapshot)
+                    raise PluginConfigValidationError(
+                        f"update_config rejected for {name!r}: {exc}"
+                    ) from exc
+                slot.ctx._config_model = validated  # noqa: SLF001
         if slot is not None:
             self._hooks_registry.trigger(HOOK_PLUGIN_CONFIG_CHANGED, slot.plugin, cfg)
 
@@ -434,6 +664,8 @@ class PluginManager:
                     "version": info.version,
                     "state": info.state.value,
                     "requires": list(info.requires),
+                    "optional_requires": list(info.optional_requires),
+                    "conflicts": list(info.conflicts),
                     "description": info.description,
                     "author": info.author,
                     "tags": list(info.tags),
@@ -442,6 +674,7 @@ class PluginManager:
                 }
                 for info in self.list_plugins()
             ],
+            "graph": self.dependency_graph(),
         }
 
     def __repr__(self) -> str:
@@ -453,7 +686,138 @@ class PluginManager:
             f"plugins={count}, enabled={enabled})"
         )
 
+    # ---------- dependency introspection ----------
+
+    def dependencies_of(self, name: str, *, transitive: bool = False) -> list[str]:
+        """Names this plugin's manifest declares as deps (hard + peer + optional).
+
+        With ``transitive=True``, also follow each dep's own deps recursively.
+        Names returned in alphabetical order for stable output.
+        """
+
+        def _direct(manifest: Any) -> set[str]:
+            out: set[str] = set()
+            for group in (manifest.requires, manifest.peer_requires, manifest.optional_requires):
+                for req in group:
+                    out.add(parse_requirement(req)[0])
+            return out
+
+        with self._lock:
+            self._require_slot(name)
+            if not transitive:
+                return sorted(_direct(self._plugins[name].plugin.manifest))
+            visited: set[str] = set()
+            stack = [name]
+            while stack:
+                current = stack.pop()
+                slot = self._plugins.get(current)
+                if slot is None:
+                    continue
+                for dep_name in _direct(slot.plugin.manifest):
+                    if dep_name not in visited:
+                        visited.add(dep_name)
+                        stack.append(dep_name)
+            visited.discard(name)
+            return sorted(visited)
+
+    def dependents_of(self, name: str, *, transitive: bool = False) -> list[str]:
+        """Names of loaded plugins that hard-require ``name``.
+
+        With ``transitive=True``, also follow each dependent's dependents.
+        Only hard ``requires`` edges count — optional deps don't create a
+        reverse edge for cascade purposes.
+        """
+        with self._lock:
+            self._require_slot(name)
+            reverse = compute_reverse_graph([s.plugin for s in self._plugins.values()])
+        if not transitive:
+            return sorted(reverse.get(name, set()))
+        visited: set[str] = set()
+        stack = [name]
+        while stack:
+            current = stack.pop()
+            for consumer in reverse.get(current, set()):
+                if consumer not in visited:
+                    visited.add(consumer)
+                    stack.append(consumer)
+        return sorted(visited)
+
+    def dependency_graph(self) -> dict[str, list[str]]:
+        """Snapshot of the pinning-dep graph: ``{plugin_name: [direct hard+peer deps...]}``.
+
+        Hard ``requires`` and ``peer_requires`` both pin the dep at
+        teardown time, so both are surfaced here. Optional deps and
+        conflicts are excluded — those are visible in :meth:`dump` and
+        :meth:`list_plugins`.
+        """
+        with self._lock:
+            slots = list(self._plugins.values())
+        out: dict[str, list[str]] = {}
+        for slot in slots:
+            manifest = slot.plugin.manifest
+            deps: set[str] = set()
+            for req in manifest.requires:
+                deps.add(parse_requirement(req)[0])
+            for req in manifest.peer_requires:
+                deps.add(parse_requirement(req)[0])
+            out[manifest.name] = sorted(deps)
+        return out
+
     # ---------- internals ----------
+
+    def _active_dependents(self, name: str) -> set[str]:
+        """Direct dependents of ``name`` (hard + peer) still in a loaded state.
+
+        Optional deps are intentionally excluded — they don't block teardown.
+        """
+        with self._lock:
+            out: set[str] = set()
+            for other_name, slot in self._plugins.items():
+                if other_name == name or slot.state == PluginState.UNLOADED:
+                    continue
+                manifest = slot.plugin.manifest
+                pinning = list(manifest.requires) + list(manifest.peer_requires)
+                for req in pinning:
+                    if parse_requirement(req)[0] == name:
+                        out.add(other_name)
+                        break
+            return out
+
+    def _enabled_dependents(self, name: str) -> set[str]:
+        """Direct hard dependents of ``name`` whose state is ENABLED."""
+        with self._lock:
+            return {
+                n
+                for n in self._active_dependents(name)
+                if self._plugins[n].state == PluginState.ENABLED
+            }
+
+    def _cascade_closure(self, name: str) -> list[str]:
+        """Return ``name``'s transitive active hard-dependents, consumers-first.
+
+        The target ``name`` itself is *not* included — callers tear these
+        names down before tearing down ``name``. Order is reverse-topo so
+        that deep dependents come first; safe to iterate and disable/unload
+        in sequence.
+        """
+        closure: set[str] = set()
+        stack = [name]
+        while stack:
+            current = stack.pop()
+            for dep in self._active_dependents(current):
+                if dep in closure:
+                    continue
+                closure.add(dep)
+                stack.append(dep)
+        if not closure:
+            return []
+        with self._lock:
+            plugins = [self._plugins[n].plugin for n in (closure | {name})]
+        ordered = resolve_load_order(plugins)
+        ordered_names = [p.manifest.name for p in ordered]
+        # ``ordered_names`` is deps-first; reverse to get consumers-first,
+        # then filter out the target.
+        return [n for n in reversed(ordered_names) if n in closure]
 
     def _require_slot(self, name: str) -> _Slot:
         slot = self._plugins.get(name)
@@ -497,7 +861,43 @@ class PluginManager:
         )
 
     def _plan_load(self, plugins: list[Plugin]) -> list[Plugin]:
-        """Validate uniqueness, merge with already-loaded plugins, return dep-ordered list."""
+        """Validate uniqueness, merge with already-loaded plugins, return dep-ordered list.
+
+        If a hard dependency is missing and resolvers are registered, this
+        method calls each resolver with the missing name and retries
+        planning. Capped at ``self._resolver_max_rounds`` rounds to surface
+        runaway resolvers.
+        """
+        batch = list(plugins)
+        seen_misses: list[str] = []
+        for _round in range(self._resolver_max_rounds):
+            try:
+                return self._plan_load_once(batch)
+            except PluginMissingDependencyError as exc:
+                if not self._resolvers:
+                    raise
+                extras = self._invoke_resolvers(exc.missing)
+                if not extras:
+                    raise
+                seen_misses.append(exc.missing)
+                existing = {p.manifest.name for p in batch} | set(self._plugins)
+                added = False
+                for p in extras:
+                    if p.manifest.name in existing:
+                        continue
+                    batch.append(p)
+                    existing.add(p.manifest.name)
+                    added = True
+                if not added:
+                    # Resolver returned plugins but none were new — give up
+                    # so we don't loop forever with the same missing name.
+                    raise
+        raise PluginDependencyError(
+            f"resolvers failed to converge after {self._resolver_max_rounds} rounds; "
+            f"missing chain: {seen_misses}"
+        )
+
+    def _plan_load_once(self, plugins: list[Plugin]) -> list[Plugin]:
         with self._lock:
             already: set[str] = set(self._plugins.keys())
             seen: set[str] = set()
@@ -513,26 +913,134 @@ class PluginManager:
             # Topo-sort considers both new plugins (for cross-deps in the batch)
             # AND already-loaded ones (so a new plugin can depend on an existing one).
             combined = list(plugins) + [s.plugin for s in self._plugins.values()]
-            try:
-                ordered_combined = resolve_load_order(combined)
-            except PluginDependencyError:
-                raise
+            ordered_combined = resolve_load_order(combined)
             # Keep only the new ones, in the resolved order.
             new_names = {p.manifest.name for p in plugins}
             return [p for p in ordered_combined if p.manifest.name in new_names]
+
+    def _invoke_resolvers(self, missing: str) -> list[Plugin]:
+        """Try each registered resolver for ``missing``; first non-empty result wins."""
+        for resolver in self._resolvers:
+            result = resolver(missing)
+            if result:
+                return list(result)
+        return []
+
+    # ---------- resolver registration ----------
+
+    def add_resolver(self, resolver: PluginResolver) -> None:
+        """Register a callable that fetches a missing dependency by name.
+
+        Resolvers are tried in registration order during :meth:`load_all`
+        whenever a hard ``requires`` entry cannot be satisfied from the
+        current batch + already-loaded set. The first resolver returning
+        a non-empty list contributes its plugins to the batch and planning
+        retries.
+        """
+        self._resolvers.append(resolver)
+
+    def use_entry_point_resolver(self, group: str) -> None:
+        """Convenience: register a resolver that looks up missing deps in ``group``.
+
+        Entry point name is matched against the plugin's manifest name
+        after scanning. Useful when the host distributes plugins as
+        installable packages — declare deps by name and let setuptools
+        do the rest.
+        """
+        cache: dict[str, list[Plugin]] = {}
+
+        def _resolve(missing: str) -> list[Plugin] | None:
+            if not cache:
+                for _ep_name, module in iter_entry_points(group):
+                    for p in scan_module(module):
+                        cache.setdefault(p.manifest.name, []).append(p)
+            return cache.get(missing)
+
+        self.add_resolver(_resolve)
+
+    def use_directory_resolver(
+        self,
+        path: Path,
+        *,
+        recursive: bool = False,
+        pattern: str = "*.py",
+    ) -> None:
+        """Convenience: register a resolver that scans ``path`` for missing deps.
+
+        Files under ``path`` are imported lazily on first miss; results are
+        cached by plugin name so subsequent misses are cheap.
+        """
+        cache: dict[str, list[Plugin]] = {}
+        scanned = [False]
+
+        def _resolve(missing: str) -> list[Plugin] | None:
+            if not scanned[0]:
+                for module in iter_directory_modules(path, recursive=recursive, pattern=pattern):
+                    for p in scan_module(module):
+                        cache.setdefault(p.manifest.name, []).append(p)
+                scanned[0] = True
+            return cache.get(missing)
+
+        self.add_resolver(_resolve)
+
+    def _call_lifecycle(
+        self, plugin: Plugin, method_name: str, ctx: PluginContext
+    ) -> Any:
+        """Invoke a plugin lifecycle method, injecting any declared-dep parameters.
+
+        Parameters past ``ctx`` whose names match an entry in the
+        plugin's ``requires`` / ``optional_requires`` / ``peer_requires``
+        are auto-filled with ``ctx.api_of(name)``. Unrecognised parameter
+        names are left unbound, surfacing as a standard ``TypeError``
+        from the call — that's the author's signal to declare the dep
+        or remove the param.
+
+        Decorator-form plugins introspect the wrapped ``setup`` callable
+        rather than the synthetic ``_DecoratedPlugin.on_load`` so the
+        user's signature is what matters.
+        """
+        if isinstance(plugin, _DecoratedPlugin) and method_name == "on_load":
+            target = plugin._setup  # noqa: SLF001 - decorator-form indirection
+            kwargs = _build_injection_kwargs(plugin, target, ctx)
+            return target(ctx, **kwargs)
+        method = getattr(plugin, method_name)
+        kwargs = _build_injection_kwargs(plugin, method, ctx)
+        return method(ctx, **kwargs)
 
     def _build_ctx(self, plugin: Plugin) -> PluginContext:
         name = plugin.manifest.name
         # ``setdefault`` guarantees ``ctx.config is self._configs[name]`` —
         # which is what makes :meth:`update_config` propagate without a reload.
         cfg = self._configs.setdefault(name, {})
-        return self._context_class(
+        ctx = self._context_class(
             plugin.manifest,
             registry=self._hooks_registry,
             config=cfg,
             tasky=self._tasky,
             scheduler=self._scheduler,
         )
+        # When the plugin declares a config_model, validate eagerly so a
+        # bad config surfaces before on_load runs against bogus values.
+        if plugin.config_model is not None:
+            try:
+                ctx._config_model = _validate_against_model(  # noqa: SLF001
+                    cfg, plugin.config_model
+                )
+            except PluginManifestError as exc:
+                raise PluginConfigValidationError(
+                    f"config for plugin {name!r} failed validation: {exc}"
+                ) from exc
+        # Class-level ``events`` → one HookPoint per entry, namespaced.
+        declared_events = plugin.events
+        if declared_events:
+            from pyhooky import HookPoint
+
+            for key, schema in declared_events.items():
+                target = f"{name}:{key}"
+                ctx._events[key] = HookPoint(  # noqa: SLF001
+                    target, schema, registry=self._hooks_registry
+                )
+        return ctx
 
     @staticmethod
     def _reject_coroutine(result: Any, name: str, op: str) -> None:
@@ -554,7 +1062,7 @@ class PluginManager:
         try:
             with _activate(ctx), tag_scope(name):
                 try:
-                    result = plugin.on_load(ctx)
+                    result = self._call_lifecycle(plugin, "on_load", ctx)
                     self._reject_coroutine(result, name, "on_load")
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
@@ -580,7 +1088,7 @@ class PluginManager:
                 slot.ctx = ctx
                 with _activate(ctx), tag_scope(name):
                     try:
-                        result = plugin.on_load(ctx)
+                        result = self._call_lifecycle(plugin, "on_load", ctx)
                         self._reject_coroutine(result, name, "on_load")
                     except Exception as exc:
                         self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
@@ -590,7 +1098,7 @@ class PluginManager:
                         ) from exc
             with _activate(slot.ctx), tag_scope(name):
                 try:
-                    result = plugin.on_enable(slot.ctx)
+                    result = self._call_lifecycle(plugin, "on_enable", slot.ctx)
                     self._reject_coroutine(result, name, "on_enable")
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
@@ -610,7 +1118,7 @@ class PluginManager:
         try:
             with _activate(slot.ctx):
                 try:
-                    result = plugin.on_disable(slot.ctx)
+                    result = self._call_lifecycle(plugin, "on_disable", slot.ctx)
                     self._reject_coroutine(result, name, "on_disable")
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
@@ -632,7 +1140,7 @@ class PluginManager:
             self._hooks_registry.trigger(HOOK_PLUGIN_UNLOAD, plugin)
             with _activate(slot.ctx):
                 try:
-                    result = plugin.on_unload(slot.ctx)
+                    result = self._call_lifecycle(plugin, "on_unload", slot.ctx)
                     self._reject_coroutine(result, name, "on_unload")
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
@@ -662,7 +1170,7 @@ class PluginManager:
         try:
             with _activate(ctx), tag_scope(name):
                 try:
-                    await self._maybe_await(plugin.on_load(ctx))
+                    await self._maybe_await(self._call_lifecycle(plugin, "on_load", ctx))
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     self._hooks_registry.clear_tag(name)
@@ -687,7 +1195,7 @@ class PluginManager:
                 slot.ctx = ctx
                 with _activate(ctx), tag_scope(name):
                     try:
-                        await self._maybe_await(plugin.on_load(ctx))
+                        await self._maybe_await(self._call_lifecycle(plugin, "on_load", ctx))
                     except Exception as exc:
                         self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                         self._hooks_registry.clear_tag(name)
@@ -696,7 +1204,9 @@ class PluginManager:
                         ) from exc
             with _activate(slot.ctx), tag_scope(name):
                 try:
-                    await self._maybe_await(plugin.on_enable(slot.ctx))
+                    await self._maybe_await(
+                        self._call_lifecycle(plugin, "on_enable", slot.ctx)
+                    )
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginLoadError(f"on_enable failed for plugin {name!r}: {exc}") from exc
@@ -715,7 +1225,9 @@ class PluginManager:
         try:
             with _activate(slot.ctx):
                 try:
-                    await self._maybe_await(plugin.on_disable(slot.ctx))
+                    await self._maybe_await(
+                        self._call_lifecycle(plugin, "on_disable", slot.ctx)
+                    )
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginLoadError(f"on_disable failed for plugin {name!r}: {exc}") from exc
@@ -736,7 +1248,9 @@ class PluginManager:
             self._hooks_registry.trigger(HOOK_PLUGIN_UNLOAD, plugin)
             with _activate(slot.ctx):
                 try:
-                    await self._maybe_await(plugin.on_unload(slot.ctx))
+                    await self._maybe_await(
+                        self._call_lifecycle(plugin, "on_unload", slot.ctx)
+                    )
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginUnloadError(f"on_unload failed for plugin {name!r}: {exc}") from exc

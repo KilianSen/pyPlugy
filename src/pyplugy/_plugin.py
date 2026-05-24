@@ -15,9 +15,12 @@ the decorator is a thin façade around the class form.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, ClassVar, overload
+from typing import TYPE_CHECKING, Any, ClassVar, overload
+
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from pyplugy.exceptions import PluginManifestError
 
@@ -45,23 +48,68 @@ class PluginState(StrEnum):
     DISABLED = "disabled"
 
 
-@dataclass(frozen=True, slots=True)
-class PluginManifest:
-    """Immutable plugin metadata.
+class PluginManifest(BaseModel):
+    """Immutable plugin metadata (pydantic-validated).
 
     ``requires`` is a list of `PEP 440 <https://peps.python.org/pep-0440/>`_
     specifiers prefixed with another plugin's name, e.g. ``"auth>=1.0"``.
     The leading identifier is the dependency name; the rest (optional) is a
     :class:`packaging.specifiers.SpecifierSet`. A bare name (``"auth"``) means
     "any version".
+
+    ``optional_requires`` uses the same string shape as ``requires`` but
+    declares a *soft* dependency: if the named plugin is present in the
+    load batch (or already loaded) it influences ordering; if missing,
+    planning proceeds without error.
+
+    ``peer_requires`` is a *host-supplied* hard dependency: planning
+    refuses to load the plugin if the named peer isn't already loaded
+    or present in the same batch, and resolvers (entry points,
+    directories) deliberately skip it. Use this when the host owns the
+    dependency's lifecycle and shouldn't have it auto-pulled.
+
+    ``conflicts`` is a tuple of plain plugin names — planning refuses
+    to load a plugin alongside any name it lists in ``conflicts`` (and
+    symmetrically refuses if a loaded plugin lists the new one).
+
+    The model is ``frozen`` and ``extra="forbid"`` — unknown fields are
+    a manifest error, surfaced via :class:`PluginManifestError`.
     """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     name: str
     version: str = "0.0.0"
     requires: tuple[str, ...] = ()
+    optional_requires: tuple[str, ...] = ()
+    peer_requires: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
     description: str = ""
     author: str = ""
     tags: tuple[str, ...] = ()
+
+    @field_validator("name")
+    @classmethod
+    def _name_nonempty(cls, v: str) -> str:
+        if not v:
+            raise ValueError("plugin name must be a non-empty string")
+        return v
+
+    @field_validator("requires", "optional_requires", "peer_requires")
+    @classmethod
+    def _validate_requirements(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        # Lazy import to avoid the _depgraph <-> _plugin cycle at module load.
+        from pyplugy._depgraph import parse_requirement
+        from pyplugy.exceptions import PluginDependencyError
+
+        for req in v:
+            try:
+                parse_requirement(req)
+            except PluginDependencyError as exc:
+                # Re-raise as ValueError so pydantic wraps it into ValidationError.
+                # _coerce_manifest then surfaces it as PluginManifestError.
+                raise ValueError(str(exc)) from exc
+        return v
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +120,9 @@ class PluginInfo:
     version: str
     state: PluginState
     requires: tuple[str, ...]
+    optional_requires: tuple[str, ...]
+    peer_requires: tuple[str, ...]
+    conflicts: tuple[str, ...]
     description: str
     author: str
     tags: tuple[str, ...]
@@ -79,25 +130,54 @@ class PluginInfo:
     tasks: tuple[str, ...]
 
 
+_NAME_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _derive_plugin_name(class_name: str) -> str:
+    """Convert a PascalCase class name to snake_case for use as a plugin name.
+
+    Examples:
+
+    - ``"Auth"`` → ``"auth"``
+    - ``"AuthPlugin"`` → ``"auth_plugin"``
+    - ``"HTTPAdapter"`` → ``"http_adapter"`` (collapses acronym runs)
+
+    Returns the empty string when ``class_name`` itself is empty — the
+    caller's downstream validation will reject that as before.
+    """
+    if not class_name:
+        return ""
+    return _NAME_BOUNDARY_RE.sub("_", class_name).lower()
+
+
 def _coerce_manifest(
     name: str,
     *,
     version: str = "0.0.0",
     requires: tuple[str, ...] | list[str] | None = None,
+    optional_requires: tuple[str, ...] | list[str] | None = None,
+    peer_requires: tuple[str, ...] | list[str] | None = None,
+    conflicts: tuple[str, ...] | list[str] | None = None,
     description: str = "",
     author: str = "",
     tags: tuple[str, ...] | list[str] | None = None,
 ) -> PluginManifest:
     if not isinstance(name, str) or not name:
         raise PluginManifestError(f"plugin name must be a non-empty string, got {name!r}")
-    return PluginManifest(
-        name=name,
-        version=version,
-        requires=tuple(requires or ()),
-        description=description,
-        author=author,
-        tags=tuple(tags or ()),
-    )
+    try:
+        return PluginManifest(
+            name=name,
+            version=version,
+            requires=tuple(requires or ()),
+            optional_requires=tuple(optional_requires or ()),
+            peer_requires=tuple(peer_requires or ()),
+            conflicts=tuple(conflicts or ()),
+            description=description,
+            author=author,
+            tags=tuple(tags or ()),
+        )
+    except ValidationError as exc:
+        raise PluginManifestError(f"invalid manifest for {name!r}: {exc}") from exc
 
 
 class Plugin:
@@ -124,16 +204,41 @@ class Plugin:
     name: ClassVar[str] = ""
     version: ClassVar[str] = "0.0.0"
     requires: ClassVar[tuple[str, ...] | list[str]] = ()
+    optional_requires: ClassVar[tuple[str, ...] | list[str]] = ()
+    peer_requires: ClassVar[tuple[str, ...] | list[str]] = ()
+    conflicts: ClassVar[tuple[str, ...] | list[str]] = ()
     description: ClassVar[str] = ""
     author: ClassVar[str] = ""
     tags: ClassVar[tuple[str, ...] | list[str]] = ()
 
+    # Optional pydantic schemas — when declared, the manager validates
+    # ``ctx.config`` against ``config_model`` and ``ctx.export(obj)``
+    # against ``api_model``. ``Any`` typing keeps the framework
+    # independent of pydantic at the import-graph level for subclasses
+    # that don't use them.
+    config_model: ClassVar[Any | None] = None
+    api_model: ClassVar[Any | None] = None
+
+    # Typed events: ``{"login": LoginEvent}`` declared at class scope
+    # turns into a ``HookPoint`` per entry, accessible via
+    # ``ctx.events["login"]`` and named ``"<plugin_name>:login"`` in the
+    # underlying registry. Optional — empty by default.
+    events: ClassVar[dict[str, Any]] = {}
+
     def __init__(self, manifest: PluginManifest | None = None) -> None:
         if manifest is None:
+            # When the subclass didn't set ``name``, derive one from the
+            # class name (PascalCase → snake_case). This is a pure
+            # ergonomic shortcut; ``_DecoratedPlugin`` passes its own
+            # name in directly and never hits this branch.
+            derived = self.name or _derive_plugin_name(type(self).__name__)
             manifest = _coerce_manifest(
-                self.name,
+                derived,
                 version=self.version,
                 requires=tuple(self.requires),
+                optional_requires=tuple(self.optional_requires),
+                peer_requires=tuple(self.peer_requires),
+                conflicts=tuple(self.conflicts),
                 description=self.description,
                 author=self.author,
                 tags=tuple(self.tags),
@@ -193,6 +298,9 @@ def plugin(
     *,
     version: str = ...,
     requires: tuple[str, ...] | list[str] | None = ...,
+    optional_requires: tuple[str, ...] | list[str] | None = ...,
+    peer_requires: tuple[str, ...] | list[str] | None = ...,
+    conflicts: tuple[str, ...] | list[str] | None = ...,
     description: str = ...,
     author: str = ...,
     tags: tuple[str, ...] | list[str] | None = ...,
@@ -202,6 +310,9 @@ def plugin(
     *,
     version: str = "0.0.0",
     requires: tuple[str, ...] | list[str] | None = None,
+    optional_requires: tuple[str, ...] | list[str] | None = None,
+    peer_requires: tuple[str, ...] | list[str] | None = None,
+    conflicts: tuple[str, ...] | list[str] | None = None,
     description: str = "",
     author: str = "",
     tags: tuple[str, ...] | list[str] | None = None,
@@ -232,6 +343,9 @@ def plugin(
             resolved_name,
             version=version,
             requires=requires,
+            optional_requires=optional_requires,
+            peer_requires=peer_requires,
+            conflicts=conflicts,
             description=description,
             author=author,
             tags=tags,
@@ -261,6 +375,9 @@ def _info_for(
         version=m.version,
         state=state,
         requires=m.requires,
+        optional_requires=m.optional_requires,
+        peer_requires=m.peer_requires,
+        conflicts=m.conflicts,
         description=m.description,
         author=m.author,
         tags=m.tags,

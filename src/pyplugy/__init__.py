@@ -22,11 +22,15 @@ from pyplugy._plugin import (
 )
 from pyplugy.exceptions import (
     PluginAlreadyLoadedError,
+    PluginConfigValidationError,
+    PluginConflictError,
     PluginDependencyError,
     PluginError,
     PluginLoadError,
     PluginManifestError,
+    PluginMissingDependencyError,
     PluginNotFoundError,
+    PluginPeerDependencyError,
     PluginUnloadError,
 )
 
@@ -39,6 +43,8 @@ __all__ = [
     "HOOK_PLUGIN_UNLOAD",
     "Plugin",
     "PluginAlreadyLoadedError",
+    "PluginConfigValidationError",
+    "PluginConflictError",
     "PluginContext",
     "PluginDependencyError",
     "PluginError",
@@ -47,7 +53,9 @@ __all__ = [
     "PluginManager",
     "PluginManifest",
     "PluginManifestError",
+    "PluginMissingDependencyError",
     "PluginNotFoundError",
+    "PluginPeerDependencyError",
     "PluginState",
     "PluginUnloadError",
     "current_context",

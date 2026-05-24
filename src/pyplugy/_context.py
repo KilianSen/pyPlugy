@@ -90,6 +90,8 @@ class PluginContext:
 
     __slots__ = (
         "_config",
+        "_config_model",
+        "_events",
         "_logger",
         "_manifest",
         "_registry",
@@ -121,6 +123,12 @@ class PluginContext:
         self._scheduler = scheduler
         self._tasks: list[Any] = []
         self._logger = logging.getLogger(f"pyplugy.{manifest.name}")
+        # Populated by the manager once it has the Plugin instance and can
+        # consult ``plugin.config_model``. Stays None when no model is declared.
+        self._config_model: Any | None = None
+        # Populated by the manager from ``plugin.events`` — one HookPoint per
+        # declared key, namespaced as ``"<plugin_name>:<key>"``.
+        self._events: dict[str, Any] = {}
 
     # ---------- exposed surface ----------
 
@@ -141,6 +149,30 @@ class PluginContext:
     def config(self) -> dict[str, Any]:
         """Mutable per-plugin config dict — populated by the manager."""
         return self._config
+
+    @property
+    def events(self) -> dict[str, Any]:
+        """Typed :class:`~pyhooky.HookPoint` instances keyed by ``Plugin.events``.
+
+        Empty when the plugin didn't declare any. Each ``HookPoint`` is
+        bound to the manager's registry; listeners attached to them are
+        auto-tagged for cleanup.
+        """
+        return self._events
+
+    @property
+    def config_model(self) -> Any | None:
+        """Validated config model instance, or ``None`` when the plugin declared no schema.
+
+        The manager populates this when the plugin declares
+        ``config_model``. After :meth:`PluginManager.update_config` runs,
+        the model is re-validated from the (now-updated) ``config`` dict.
+        If a plugin mutates ``ctx.config`` directly, ``config_model``
+        won't pick up the change until the next ``update_config`` call —
+        explicit mutation is the loose path, validated updates are the
+        sharp one.
+        """
+        return self._config_model
 
     @property
     def logger(self) -> logging.Logger:
@@ -203,6 +235,147 @@ class PluginContext:
             return _hook(target, registry=self._registry, **kwargs)
         return _hook(target, fn, registry=self._registry, **kwargs)
 
+    # ---------- typed events (pyHooky HookPoint factory) ----------
+
+    def event(self, name: str, schema: Any) -> Any:
+        """Return a pyHooky :class:`~pyhooky.HookPoint` bound to this manager.
+
+        ``schema`` is a pydantic :class:`~pydantic.BaseModel` subclass.
+        The returned ``HookPoint`` dispatches through the same registry
+        the manager owns, so listeners attached inside the plugin's
+        lifecycle are tagged with the plugin name automatically (via
+        the existing ``tag_scope`` block) and torn down with it.
+
+        Plugins typically bind the result locally::
+
+            login = ctx.event("auth:login", LoginEvent)
+            @login.listen
+            def audit(evt: LoginEvent): ...
+            login.trigger(user="alice")
+        """
+        from pyhooky import HookPoint
+
+        return HookPoint(name, schema, registry=self._registry)
+
+    # ---------- dependency access ----------
+
+    def dep(self, name: str) -> PluginContext | None:
+        """Return the :class:`PluginContext` of a declared dependency.
+
+        ``name`` must appear in this plugin's ``requires`` or
+        ``optional_requires``; otherwise a :class:`PluginDependencyError`
+        is raised so the manifest stays the single source of truth for the
+        plugin graph. For hard deps the manager guarantees the slot exists
+        (load order resolves dependencies first). For optional deps that
+        aren't currently loaded, returns ``None``.
+
+        Must be called inside a lifecycle hook (``on_load`` / ``on_enable``
+        / etc.) so that :func:`~pyplugy._manager.current_manager` is set.
+        """
+        from pyplugy._manager import current_manager
+        from pyplugy.exceptions import PluginDependencyError
+
+        declared = set(self._manifest.requires) | set(self._manifest.optional_requires)
+        # Strip version specifiers — match by name only.
+        from pyplugy._depgraph import parse_requirement
+
+        declared_names = {parse_requirement(r)[0] for r in declared}
+        if name not in declared_names:
+            raise PluginDependencyError(
+                f"plugin {self._manifest.name!r} did not declare dep {name!r}; "
+                f"add it to requires or optional_requires"
+            )
+        manager = current_manager()
+        if manager is None:
+            raise PluginDependencyError(
+                f"ctx.dep({name!r}) called outside an active lifecycle hook; "
+                "no current manager"
+            )
+        slot = manager._plugins.get(name)  # noqa: SLF001 - manager-internal lookup
+        if slot is None:
+            # Optional dep that isn't loaded — silently absent.
+            if name in {parse_requirement(r)[0] for r in self._manifest.optional_requires}:
+                return None
+            # Hard dep should always be present at this point.
+            raise PluginDependencyError(
+                f"plugin {self._manifest.name!r} requires {name!r} but it is not loaded"
+            )
+        return slot.ctx
+
+    depends_on = dep
+
+    def export(self, obj: Any) -> Any:
+        """Publish ``obj`` as this plugin's API for dependents.
+
+        ``ctx.api_of(name)`` returns whatever was last passed here.
+        Must be called inside a lifecycle hook (``on_load`` / ``on_enable``).
+        Calling more than once is allowed — the latest call wins, which
+        makes it safe to call from both ``on_load`` and ``on_enable``.
+
+        When the plugin declares ``api_model`` (a pydantic
+        :class:`~pydantic.BaseModel` subclass), ``obj`` is validated
+        against it: a dict is parsed into the model, an existing model
+        instance is type-checked, and anything else raises
+        :class:`PluginManifestError`-equivalent error from pydantic.
+
+        Returns the stored value (the validated model, or ``obj``
+        verbatim when no ``api_model`` is declared).
+        """
+        from pyplugy._manager import current_manager
+        from pyplugy.exceptions import PluginError
+
+        manager = current_manager()
+        if manager is None:
+            raise PluginError(
+                f"ctx.export(...) called outside an active lifecycle hook for "
+                f"plugin {self._manifest.name!r}"
+            )
+        slot = manager._plugins.get(self._manifest.name)  # noqa: SLF001
+        if slot is None:
+            raise PluginError(
+                f"ctx.export(...) called for {self._manifest.name!r} but the "
+                "manager has no slot for it — was on_load aborted?"
+            )
+        validated = _validate_against_model(obj, slot.plugin.api_model)
+        slot.api = validated
+        return validated
+
+    def api_of(self, name: str) -> Any:
+        """Return the API another plugin published via :meth:`export`.
+
+        ``name`` must appear in this plugin's
+        ``requires`` / ``optional_requires`` / ``peer_requires`` — the
+        same declaration check that :meth:`dep` enforces. Returns ``None``
+        if the dep is loaded but never called ``export``, or if it's an
+        unsatisfied optional dep.
+        """
+        from pyplugy._depgraph import parse_requirement
+        from pyplugy._manager import current_manager
+        from pyplugy.exceptions import PluginDependencyError
+
+        declared = {
+            parse_requirement(r)[0]
+            for r in (
+                *self._manifest.requires,
+                *self._manifest.optional_requires,
+                *self._manifest.peer_requires,
+            )
+        }
+        if name not in declared:
+            raise PluginDependencyError(
+                f"plugin {self._manifest.name!r} did not declare dep {name!r}; "
+                f"add it to requires / optional_requires / peer_requires"
+            )
+        manager = current_manager()
+        if manager is None:
+            raise PluginDependencyError(
+                f"ctx.api_of({name!r}) called outside an active lifecycle hook"
+            )
+        slot = manager._plugins.get(name)  # noqa: SLF001
+        if slot is None:
+            return None
+        return slot.api
+
     # ---------- task passthroughs ----------
 
     def task(self, fn: Callable[..., Any] | None = None, **kwargs: Any) -> Any:
@@ -215,6 +388,24 @@ class PluginContext:
         Both bare (``@ctx.task``) and parameterised (``@ctx.task(retries=3)``)
         decorator forms work — same call shape as ``@pyworkflowy.task``.
         """
+        def _record(task_obj: Any) -> Any:
+            self._tasks.append(task_obj)
+            return task_obj
+
+        # pyWorkflowy class form: ``ctx.task(MyTaskClass)`` — instantiating
+        # a TaskBase subclass returns a Task directly (via TaskBase.__new__),
+        # so we register that instance and return it. Lazy import keeps
+        # pyworkflowy optional for plugins that only use the decorator form.
+        # Handled before the tasky-required check so this form works even
+        # when the manager has no tasky configured.
+        if isinstance(fn, type):
+            try:
+                from pyworkflowy import TaskBase
+            except ImportError:
+                TaskBase = None  # type: ignore[assignment]
+            if TaskBase is not None and issubclass(fn, TaskBase):
+                return _record(fn())
+
         if self._tasky is None:
             raise RuntimeError(
                 f"plugin {self._manifest.name!r} called ctx.task but no task backend is "
@@ -223,10 +414,6 @@ class PluginContext:
             )
 
         decorator = self._tasky.task
-
-        def _record(task_obj: Any) -> Any:
-            self._tasks.append(task_obj)
-            return task_obj
 
         if fn is None:
             # Parameterised — `@ctx.task(retries=3)`
@@ -251,6 +438,40 @@ class PluginContext:
             f"PluginContext(name={self._manifest.name!r}, "
             f"registry={self._registry.name!r}, tasks={len(self._tasks)})"
         )
+
+
+def _validate_against_model(obj: Any, model: Any | None) -> Any:
+    """Coerce/validate ``obj`` against ``model`` (a pydantic ``BaseModel`` subclass).
+
+    ``model=None`` → return ``obj`` as-is. ``obj`` already an instance of
+    ``model`` → returned unchanged. ``obj`` is a dict → parsed via
+    ``model.model_validate``. Anything else with a non-None model raises
+    :class:`PluginManifestError` so misuses fail loudly at the boundary.
+    """
+    from pydantic import BaseModel, ValidationError
+
+    from pyplugy.exceptions import PluginManifestError
+
+    if model is None:
+        return obj
+    if isinstance(obj, model):
+        return obj
+    if isinstance(obj, dict):
+        try:
+            return model.model_validate(obj)
+        except ValidationError as exc:
+            raise PluginManifestError(
+                f"export payload failed validation against {model.__name__}: {exc}"
+            ) from exc
+    if isinstance(obj, BaseModel):
+        raise PluginManifestError(
+            f"export payload is a {type(obj).__name__} instance but {model.__name__} "
+            "was declared as api_model; types don't match"
+        )
+    raise PluginManifestError(
+        f"export payload of type {type(obj).__name__} cannot be coerced to {model.__name__}; "
+        "pass a dict or an instance of the declared model"
+    )
 
 
 def _activate(ctx: PluginContext) -> Any:
