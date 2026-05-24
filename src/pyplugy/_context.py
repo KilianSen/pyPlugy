@@ -291,7 +291,7 @@ class PluginContext:
                 f"ctx.dep({name!r}) called outside an active lifecycle hook; "
                 "no current manager"
             )
-        slot = manager._plugins.get(name)  # noqa: SLF001 - manager-internal lookup
+        slot = manager._plugins.get(name)
         if slot is None:
             # Optional dep that isn't loaded — silently absent.
             if name in {parse_requirement(r)[0] for r in self._manifest.optional_requires}:
@@ -330,7 +330,7 @@ class PluginContext:
                 f"ctx.export(...) called outside an active lifecycle hook for "
                 f"plugin {self._manifest.name!r}"
             )
-        slot = manager._plugins.get(self._manifest.name)  # noqa: SLF001
+        slot = manager._plugins.get(self._manifest.name)
         if slot is None:
             raise PluginError(
                 f"ctx.export(...) called for {self._manifest.name!r} but the "
@@ -371,7 +371,7 @@ class PluginContext:
             raise PluginDependencyError(
                 f"ctx.api_of({name!r}) called outside an active lifecycle hook"
             )
-        slot = manager._plugins.get(name)  # noqa: SLF001
+        slot = manager._plugins.get(name)
         if slot is None:
             return None
         return slot.api

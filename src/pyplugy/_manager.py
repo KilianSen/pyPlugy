@@ -610,7 +610,7 @@ class PluginManager:
                     raise PluginConfigValidationError(
                         f"update_config rejected for {name!r}: {exc}"
                     ) from exc
-                slot.ctx._config_model = validated  # noqa: SLF001
+                slot.ctx._config_model = validated
         if slot is not None:
             self._hooks_registry.trigger(HOOK_PLUGIN_CONFIG_CHANGED, slot.plugin, cfg)
 
@@ -1000,7 +1000,7 @@ class PluginManager:
         user's signature is what matters.
         """
         if isinstance(plugin, _DecoratedPlugin) and method_name == "on_load":
-            target = plugin._setup  # noqa: SLF001 - decorator-form indirection
+            target = plugin._setup
             kwargs = _build_injection_kwargs(plugin, target, ctx)
             return target(ctx, **kwargs)
         method = getattr(plugin, method_name)
@@ -1023,7 +1023,7 @@ class PluginManager:
         # bad config surfaces before on_load runs against bogus values.
         if plugin.config_model is not None:
             try:
-                ctx._config_model = _validate_against_model(  # noqa: SLF001
+                ctx._config_model = _validate_against_model(
                     cfg, plugin.config_model
                 )
             except PluginManifestError as exc:
@@ -1037,7 +1037,7 @@ class PluginManager:
 
             for key, schema in declared_events.items():
                 target = f"{name}:{key}"
-                ctx._events[key] = HookPoint(  # noqa: SLF001
+                ctx._events[key] = HookPoint(
                     target, schema, registry=self._hooks_registry
                 )
         return ctx

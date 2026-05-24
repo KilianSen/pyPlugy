@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 from pydantic import BaseModel
 from pyworkflowy import TaskBase
@@ -13,7 +15,6 @@ from pyplugy import (
     plugin,
 )
 from pyplugy._plugin import _derive_plugin_name
-
 
 # ---------- auto-derived plugin name ----------
 
@@ -116,7 +117,10 @@ def test_class_level_events_populate_ctx(manager: PluginManager) -> None:
 
     class Auth(Plugin):
         version = "1.0.0"
-        events = {"login": _LoginEvent, "logout": _LogoutEvent}
+        events: ClassVar[dict[str, type[BaseModel]]] = {
+            "login": _LoginEvent,
+            "logout": _LogoutEvent,
+        }
 
         def on_load(self, ctx: PluginContext) -> None:
             captured["keys"] = sorted(ctx.events.keys())
@@ -135,7 +139,7 @@ def test_class_level_event_listener_fires(manager: PluginManager) -> None:
 
     class Auth(Plugin):
         version = "1.0.0"
-        events = {"login": _LoginEvent}
+        events: ClassVar[dict[str, type[BaseModel]]] = {"login": _LoginEvent}
 
         def on_load(self, ctx: PluginContext) -> None:
             @ctx.events["login"].listen
@@ -193,7 +197,7 @@ def test_injection_class_form(manager: PluginManager) -> None:
     class Users(Plugin):
         name = "i_users"
         version = "1.0.0"
-        requires = ["i_auth"]
+        requires = ("i_auth",)
 
         def on_load(self, ctx: PluginContext, i_auth: _AuthAPI) -> None:
             received["api"] = i_auth

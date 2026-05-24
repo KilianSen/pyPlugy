@@ -21,7 +21,6 @@ from pyplugy._depgraph import (
     resolve_load_order,
 )
 
-
 # ---------- manifest fields ----------
 
 
@@ -181,7 +180,7 @@ def _make_chain() -> tuple[Plugin, Plugin, Plugin]:
 def test_unload_refuses_with_active_dependents(manager: PluginManager) -> None:
     base, mid, top = _make_chain()
     manager.load_all([base, mid, top])
-    with pytest.raises(PluginDependencyError, match="c_mid|c_top"):
+    with pytest.raises(PluginDependencyError, match=r"c_mid|c_top"):
         manager.unload("c_base")
 
 
@@ -379,7 +378,7 @@ def test_resolver_runaway_caps_out(manager: PluginManager) -> None:
         return [chain]
 
     manager.add_resolver(bad_resolver)
-    with pytest.raises(PluginDependencyError, match="converge|loaded"):
+    with pytest.raises(PluginDependencyError, match=r"converge|loaded"):
         manager.load(user)
 
 

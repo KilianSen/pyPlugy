@@ -20,7 +20,6 @@ from pyplugy import (
 )
 from pyplugy._depgraph import resolve_load_order
 
-
 # ---------- pydantic manifest ----------
 
 
@@ -30,12 +29,12 @@ def test_manifest_is_basemodel() -> None:
 
 def test_manifest_frozen() -> None:
     m = PluginManifest(name="x")
-    with pytest.raises(Exception):  # noqa: B017,PT011 - frozen raises ValidationError
+    with pytest.raises(Exception):  # noqa: B017 - frozen raises ValidationError
         m.name = "y"
 
 
 def test_manifest_extra_forbidden() -> None:
-    with pytest.raises(Exception):  # noqa: B017,PT011 - pydantic ValidationError
+    with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
         PluginManifest(name="x", typo_field=1)  # type: ignore[call-arg]
 
 
