@@ -1,6 +1,25 @@
 # CHANGELOG
 
 
+## v0.3.0 (2026-05-24)
+
+### Features
+
+- Update pyworkflowy dependency to 0.2.0 and add pydantic support
+  ([`9e72769`](https://github.com/KilianSen/pyPlugy/commit/9e727695aeba460bc5458b3377e1cd8f6f8f14c0))
+
+### Refactoring
+
+- Improve type hints and validation logic in plugin and manager modules
+  ([`3626873`](https://github.com/KilianSen/pyPlugy/commit/3626873b9b67a318c448eda0dc7e423548dcde49))
+
+- Remove unnecessary noqa comments and improve type hints in tests
+  ([`06cacb9`](https://github.com/KilianSen/pyPlugy/commit/06cacb94c55b6a5263baa42bc9629722571ab22e))
+
+- Streamline function signatures and remove unnecessary line breaks
+  ([`1fdb2aa`](https://github.com/KilianSen/pyPlugy/commit/1fdb2aacfe0235b23062aa1e212590c8e800d997))
+
+
 ## v0.2.0 (2026-05-23)
 
 ### Features
