@@ -983,9 +983,7 @@ class PluginManager:
 
         self.add_resolver(_resolve)
 
-    def _call_lifecycle(
-        self, plugin: Plugin, method_name: str, ctx: PluginContext
-    ) -> Any:
+    def _call_lifecycle(self, plugin: Plugin, method_name: str, ctx: PluginContext) -> Any:
         """Invoke a plugin lifecycle method, injecting any declared-dep parameters.
 
         Parameters past ``ctx`` whose names match an entry in the
@@ -1023,9 +1021,7 @@ class PluginManager:
         # bad config surfaces before on_load runs against bogus values.
         if plugin.config_model is not None:
             try:
-                ctx._config_model = _validate_against_model(
-                    cfg, plugin.config_model
-                )
+                ctx._config_model = _validate_against_model(cfg, plugin.config_model)
             except PluginManifestError as exc:
                 raise PluginConfigValidationError(
                     f"config for plugin {name!r} failed validation: {exc}"
@@ -1037,9 +1033,7 @@ class PluginManager:
 
             for key, schema in declared_events.items():
                 target = f"{name}:{key}"
-                ctx._events[key] = HookPoint(
-                    target, schema, registry=self._hooks_registry
-                )
+                ctx._events[key] = HookPoint(target, schema, registry=self._hooks_registry)
         return ctx
 
     @staticmethod
@@ -1204,9 +1198,7 @@ class PluginManager:
                         ) from exc
             with _activate(slot.ctx), tag_scope(name):
                 try:
-                    await self._maybe_await(
-                        self._call_lifecycle(plugin, "on_enable", slot.ctx)
-                    )
+                    await self._maybe_await(self._call_lifecycle(plugin, "on_enable", slot.ctx))
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginLoadError(f"on_enable failed for plugin {name!r}: {exc}") from exc
@@ -1225,9 +1217,7 @@ class PluginManager:
         try:
             with _activate(slot.ctx):
                 try:
-                    await self._maybe_await(
-                        self._call_lifecycle(plugin, "on_disable", slot.ctx)
-                    )
+                    await self._maybe_await(self._call_lifecycle(plugin, "on_disable", slot.ctx))
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginLoadError(f"on_disable failed for plugin {name!r}: {exc}") from exc
@@ -1248,9 +1238,7 @@ class PluginManager:
             self._hooks_registry.trigger(HOOK_PLUGIN_UNLOAD, plugin)
             with _activate(slot.ctx):
                 try:
-                    await self._maybe_await(
-                        self._call_lifecycle(plugin, "on_unload", slot.ctx)
-                    )
+                    await self._maybe_await(self._call_lifecycle(plugin, "on_unload", slot.ctx))
                 except Exception as exc:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginUnloadError(f"on_unload failed for plugin {name!r}: {exc}") from exc

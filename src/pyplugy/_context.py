@@ -288,8 +288,7 @@ class PluginContext:
         manager = current_manager()
         if manager is None:
             raise PluginDependencyError(
-                f"ctx.dep({name!r}) called outside an active lifecycle hook; "
-                "no current manager"
+                f"ctx.dep({name!r}) called outside an active lifecycle hook; no current manager"
             )
         slot = manager._plugins.get(name)
         if slot is None:
@@ -388,6 +387,7 @@ class PluginContext:
         Both bare (``@ctx.task``) and parameterised (``@ctx.task(retries=3)``)
         decorator forms work — same call shape as ``@pyworkflowy.task``.
         """
+
         def _record(task_obj: Any) -> Any:
             self._tasks.append(task_obj)
             return task_obj

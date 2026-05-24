@@ -382,9 +382,7 @@ def test_resolver_runaway_caps_out(manager: PluginManager) -> None:
         manager.load(user)
 
 
-def test_directory_resolver_loads_missing_dep(
-    manager: PluginManager, tmp_path: Path
-) -> None:
+def test_directory_resolver_loads_missing_dep(manager: PluginManager, tmp_path: Path) -> None:
     plugin_file = tmp_path / "dep_plugin.py"
     plugin_file.write_text(
         "from pyplugy import plugin\n"
