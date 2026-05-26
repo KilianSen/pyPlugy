@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from pyhooky import HookRegistry
 
     from pyplugy._plugin import PluginManifest
+    from pyplugy._task_info import PluginTaskInfo
     from pyplugy._tasky_protocol import SchedulerProtocol, TaskyProtocol
 
 
@@ -96,7 +97,7 @@ class PluginContext:
         "_manifest",
         "_registry",
         "_scheduler",
-        "_tasks",
+        "_task_infos",
         "_tasky",
     )
 
@@ -121,7 +122,7 @@ class PluginContext:
             self._config = dict(config or {})
         self._tasky = tasky
         self._scheduler = scheduler
-        self._tasks: list[Any] = []
+        self._task_infos: list[PluginTaskInfo] = []
         self._logger = logging.getLogger(f"pyplugy.{manifest.name}")
         # Populated by the manager once it has the Plugin instance and can
         # consult ``plugin.config_model``. Stays None when no model is declared.
@@ -185,9 +186,13 @@ class PluginContext:
         return self._scheduler
 
     @property
-    def tasks(self) -> tuple[Any, ...]:
-        """Tasks registered via :meth:`task`, in registration order."""
-        return tuple(self._tasks)
+    def tasks(self) -> tuple[PluginTaskInfo, ...]:
+        """Tasks registered via :meth:`task`, in registration order.
+
+        Each entry is a :class:`PluginTaskInfo` carrying the underlying task
+        object and the host-supplied ``metadata`` mapping (empty by default).
+        """
+        return tuple(self._task_infos)
 
     # ---------- hook passthroughs ----------
 
@@ -377,7 +382,13 @@ class PluginContext:
 
     # ---------- task passthroughs ----------
 
-    def task(self, fn: Callable[..., Any] | None = None, **kwargs: Any) -> Any:
+    def task(
+        self,
+        fn: Callable[..., Any] | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """Register a task with the plugin's task scope.
 
         Requires a :mod:`pyplugy._tasky_protocol`-compatible object on the
@@ -386,10 +397,17 @@ class PluginContext:
 
         Both bare (``@ctx.task``) and parameterised (``@ctx.task(retries=3)``)
         decorator forms work — same call shape as ``@pyworkflowy.task``.
+
+        Pass ``metadata={...}`` to attach host-specific data to the registered
+        task; it surfaces unchanged via :attr:`tasks` and
+        :meth:`PluginManager.plugin_tasks`. pyplugy never inspects it.
         """
+        from pyplugy._task_info import PluginTaskInfo
+
+        md: Mapping[str, Any] = dict(metadata) if metadata else {}
 
         def _record(task_obj: Any) -> Any:
-            self._tasks.append(task_obj)
+            self._task_infos.append(PluginTaskInfo(task=task_obj, metadata=md))
             return task_obj
 
         # pyWorkflowy class form: ``ctx.task(MyTaskClass)`` — instantiating
@@ -436,7 +454,7 @@ class PluginContext:
     def __repr__(self) -> str:
         return (
             f"PluginContext(name={self._manifest.name!r}, "
-            f"registry={self._registry.name!r}, tasks={len(self._tasks)})"
+            f"registry={self._registry.name!r}, tasks={len(self._task_infos)})"
         )
 
 

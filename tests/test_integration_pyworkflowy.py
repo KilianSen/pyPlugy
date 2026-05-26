@@ -29,7 +29,7 @@ def test_plugin_registers_real_pyworkflowy_task() -> None:
         captured["double"] = double
 
     manager.load(setup)
-    assert manager.plugin_tasks("calc") == ["double"]
+    assert [i.task.name for i in manager.plugin_tasks("calc")] == ["double"]
     assert isinstance(captured["double"], Task)
 
     with TaskRunner() as runner:
@@ -61,7 +61,7 @@ def test_plugin_real_task_with_retry_and_dependencies() -> None:
         captured["flaky"] = flaky
 
     manager.load(setup)
-    assert manager.plugin_tasks("workflow") == ["seed", "flaky"]
+    assert [i.task.name for i in manager.plugin_tasks("workflow")] == ["seed", "flaky"]
 
     with TaskRunner() as runner:
         seed_handle = captured["seed"].submit()
@@ -100,7 +100,7 @@ def test_unload_clears_plugin_tasks() -> None:
             return None
 
     manager.load(setup)
-    assert manager.plugin_tasks("ephemeral") == ["work"]
+    assert [i.task.name for i in manager.plugin_tasks("ephemeral")] == ["work"]
 
     manager.unload("ephemeral")
     assert "ephemeral" not in [info.name for info in manager.list_plugins()]
@@ -122,7 +122,7 @@ def test_class_plugin_with_real_pyworkflowy() -> None:
             captured["run"] = run
 
     manager.load(WorkerPlugin)
-    assert manager.plugin_tasks("worker") == ["run"]
+    assert [i.task.name for i in manager.plugin_tasks("worker")] == ["run"]
     assert isinstance(captured["run"], Task)
     assert captured["run"].is_async is True
 
@@ -146,7 +146,7 @@ def test_unload_clears_hooks_alongside_tasks() -> None:
 
     manager.load(setup)
     assert manager.plugin_targets("bundled") == ["some-target"]
-    assert manager.plugin_tasks("bundled") == ["my-task"]
+    assert [i.task.name for i in manager.plugin_tasks("bundled")] == ["my-task"]
 
     manager.unload("bundled")
     assert manager.plugin_targets.__self__ is manager  # sanity: method bound

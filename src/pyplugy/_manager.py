@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from pathlib import Path
     from types import ModuleType
 
+    from pyplugy._task_info import PluginTaskInfo
     from pyplugy._tasky_protocol import SchedulerProtocol, TaskyProtocol
 
     PluginResolver = Callable[[str], "list[Plugin] | None"]
@@ -637,11 +638,17 @@ class PluginManager:
                 targets.add(target_name)
         return sorted(targets)
 
-    def plugin_tasks(self, name: str) -> list[str]:
-        """Task names owned by ``name``."""
+    def plugin_tasks(self, name: str) -> tuple[PluginTaskInfo, ...]:
+        """Tasks owned by ``name`` as :class:`PluginTaskInfo` entries.
+
+        Each entry pairs the underlying task object with the host-supplied
+        metadata captured at ``ctx.task(metadata=...)``. Returns an empty
+        tuple when the plugin is loaded but has no tasks (or is currently
+        disabled — disable clears the task list).
+        """
         with self._lock:
             slot = self._require_slot(name)
-            return [getattr(t, "name", repr(t)) for t in slot.ctx.tasks]
+            return slot.ctx.tasks
 
     def list_plugins(self) -> list[PluginInfo]:
         with self._lock:
@@ -649,7 +656,10 @@ class PluginManager:
         out: list[PluginInfo] = []
         for slot in slots:
             targets = tuple(self.plugin_targets(slot.plugin.manifest.name))
-            tasks = tuple(self.plugin_tasks(slot.plugin.manifest.name))
+            tasks = tuple(
+                getattr(i.task, "name", repr(i.task))
+                for i in self.plugin_tasks(slot.plugin.manifest.name)
+            )
             out.append(_info_for(slot.plugin, state=slot.state, targets=targets, tasks=tasks))
         return out
 
@@ -1118,7 +1128,7 @@ class PluginManager:
                     raise PluginLoadError(f"on_disable failed for plugin {name!r}: {exc}") from exc
             removed = self._hooks_registry.clear_tag(name)
             _logger.debug("pyplugy: disabled %r — cleared %d hook(s)", name, len(removed))
-            slot.ctx._tasks.clear()
+            slot.ctx._task_infos.clear()
             slot.state = PluginState.DISABLED
             self._hooks_registry.trigger(HOOK_PLUGIN_DISABLE, plugin)
         finally:
@@ -1222,7 +1232,7 @@ class PluginManager:
                     raise PluginLoadError(f"on_disable failed for plugin {name!r}: {exc}") from exc
             removed = self._hooks_registry.clear_tag(name)
             _logger.debug("pyplugy: disabled %r — cleared %d hook(s)", name, len(removed))
-            slot.ctx._tasks.clear()
+            slot.ctx._task_infos.clear()
             slot.state = PluginState.DISABLED
             self._hooks_registry.trigger(HOOK_PLUGIN_DISABLE, plugin)
         finally:

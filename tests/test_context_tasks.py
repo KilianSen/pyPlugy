@@ -28,7 +28,7 @@ def test_ctx_task_bare_decorator(manager_with_tasks: PluginManager, fake_tasky) 
 
     manager_with_tasks.load(setup)
     assert any(t.name == "cleanup" for t in fake_tasky.registered)
-    assert manager_with_tasks.plugin_tasks("has-task") == ["cleanup"]
+    assert [i.task.name for i in manager_with_tasks.plugin_tasks("has-task")] == ["cleanup"]
 
 
 def test_ctx_task_with_kwargs(manager_with_tasks: PluginManager, fake_tasky) -> None:
@@ -51,9 +51,34 @@ def test_ctx_tasks_cleared_on_disable(manager_with_tasks: PluginManager) -> None
             return None
 
     manager_with_tasks.load(setup)
-    assert manager_with_tasks.plugin_tasks("toggle-tasks") == ["t"]
+    assert [i.task.name for i in manager_with_tasks.plugin_tasks("toggle-tasks")] == ["t"]
     manager_with_tasks.disable("toggle-tasks")
-    assert manager_with_tasks.plugin_tasks("toggle-tasks") == []
+    assert manager_with_tasks.plugin_tasks("toggle-tasks") == ()
+
+
+def test_ctx_task_metadata_passthrough(manager_with_tasks: PluginManager) -> None:
+    @plugin("meta-task", version="1.0.0")
+    def setup(ctx: PluginContext) -> None:
+        @ctx.task(metadata={"category": "reactive", "priority": 5})
+        def t() -> None:
+            return None
+
+    manager_with_tasks.load(setup)
+    infos = manager_with_tasks.plugin_tasks("meta-task")
+    assert len(infos) == 1
+    assert infos[0].task.name == "t"
+    assert dict(infos[0].metadata) == {"category": "reactive", "priority": 5}
+
+
+def test_ctx_task_default_metadata_is_empty(manager_with_tasks: PluginManager) -> None:
+    @plugin("nometa", version="1.0.0")
+    def setup(ctx: PluginContext) -> None:
+        @ctx.task
+        def t() -> None: ...
+
+    manager_with_tasks.load(setup)
+    info = manager_with_tasks.plugin_tasks("nometa")[0]
+    assert dict(info.metadata) == {}
 
 
 def test_scheduler_passed_through(manager_with_tasks: PluginManager, fake_scheduler) -> None:
