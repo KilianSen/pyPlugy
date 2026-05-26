@@ -166,6 +166,7 @@ class PluginManager:
         "_plugins",
         "_resolver_max_rounds",
         "_resolvers",
+        "_scheduled_jobs",
         "_scheduler",
         "_tasky",
     )
@@ -191,6 +192,7 @@ class PluginManager:
         self._lock = threading.RLock()
         self._resolvers: list[PluginResolver] = []
         self._resolver_max_rounds = resolver_max_rounds
+        self._scheduled_jobs: dict[str, list[Any]] = {}
 
     # ---------- public properties ----------
 
