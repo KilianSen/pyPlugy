@@ -679,7 +679,10 @@ class PluginManager:
                     "tags": list(info.tags),
                     "targets": list(info.targets),
                     "tasks": [
-                        {"name": getattr(t.task, "name", repr(t.task)), "metadata": dict(t.metadata)}
+                        {
+                            "name": getattr(t.task, "name", repr(t.task)),
+                            "metadata": dict(t.metadata),
+                        }
                         for t in info.tasks
                     ],
                 }

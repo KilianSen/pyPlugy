@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 __all__ = ["PluginTaskInfo"]
 
 
-_EMPTY_METADATA: "Mapping[str, Any]" = MappingProxyType({})
+_EMPTY_METADATA: Mapping[str, Any] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,4 +33,4 @@ class PluginTaskInfo:
     """
 
     task: Any
-    metadata: "Mapping[str, Any]" = field(default_factory=lambda: _EMPTY_METADATA)
+    metadata: Mapping[str, Any] = field(default_factory=lambda: _EMPTY_METADATA)
