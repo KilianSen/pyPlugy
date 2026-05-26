@@ -1,26 +1,93 @@
 # CHANGELOG
 
 
-## v0.4.0 (UNRELEASED)
+## v0.4.0 (2026-05-26)
+
+### Chores
+
+- Ruff cleanup for 0.4 tasks work
+  ([`a864af0`](https://github.com/KilianSen/pyPlugy/commit/a864af09f645a533f90c3b9e593e922f982c9b6b))
+
+Remove redundant string-quoted annotations (covered by __future__ annotations) and wrap the dump()
+  tasks comprehension within the 100-col limit.
+
+### Documentation
+
+- Update README for improved clarity and structure, enhance plugin context details
+  ([`be77408`](https://github.com/KilianSen/pyPlugy/commit/be7740801636837f2f237d0c800f2fe765620fc7))
+
+- **tasks**: Document metadata, auto-wire, and 0.4 breaking changes
+  ([`dca380c`](https://github.com/KilianSen/pyPlugy/commit/dca380c9d1f53e2e5a962efc1955891d48f34ed9))
+
+Updates README's plugin_tasks signature and adds two new subsections under "Integration with
+  pyWorkflowy" (Triggers auto-wire on enable, Host metadata). CHANGELOG gains a 0.4.0 entry listing
+  the new features and the three breaking changes to the tasks surface.
 
 ### Features
 
-- `ctx.task(metadata={...})` attaches host-specific data to a registered task,
-  surfaced via `ctx.tasks` and `PluginManager.plugin_tasks(name)`.
-- `PluginManager` auto-binds tasks with non-empty `triggers` to the scheduler
-  on `enable()` and cancels the bound jobs on `disable()`.
+- **tasks**: Add _scheduled_jobs bookkeeping slot to PluginManager
+  ([`1df3668`](https://github.com/KilianSen/pyPlugy/commit/1df36680f50a1ba3f98a22bce623984376ecfe00))
 
-### Breaking changes
+Tracks scheduler jobs per plugin so disable() can cancel them. Initialised empty; populated in a
+  follow-up commit that wires trigger/cron tasks to the scheduler on enable.
 
-- `PluginContext.tasks` now returns `tuple[PluginTaskInfo, ...]` instead of
-  the raw task objects. Read `info.task` for the underlying task.
-- `PluginManager.plugin_tasks(name)` now returns `tuple[PluginTaskInfo, ...]`
-  instead of `list[str]`. Use `[i.task.name for i in manager.plugin_tasks(name)]`
-  for the prior shape.
-- `PluginInfo.tasks` is now `tuple[PluginTaskInfo, ...]`. `PluginManager.dump()`
-  serialises each entry as `{"name": ..., "metadata": ...}`.
-- `SchedulerProtocol` widened: implementations must expose `bind_tasks(*tasks)`
-  and `cancel(job)`. pyWorkflowy's `Scheduler` already satisfies both.
+- **tasks**: Add PluginTaskInfo value-object
+  ([`eed5d65`](https://github.com/KilianSen/pyPlugy/commit/eed5d65275a48c99613323e4c97ac56f6ceb4b85))
+
+Pairs a registered task with host-supplied metadata. Frozen + slotted; metadata defaults to an empty
+  mapping. Re-exported from the package root for use by hosts that introspect ctx.tasks /
+  plugin_tasks(name).
+
+- **tasks**: Auto-wire task triggers + cron on enable; teardown on disable
+  ([`63f0d50`](https://github.com/KilianSen/pyPlugy/commit/63f0d506a479268ac60ffca9f4e71939951ea600))
+
+After a plugin's on_enable returns, the manager walks ctx.tasks and binds each task with non-empty
+  triggers via scheduler.bind_tasks, and each task exposing a cron attribute via
+  scheduler.cron(expr).do(task). The resulting jobs are stored on _scheduled_jobs[plugin_name] and
+  cancelled when the plugin transitions to DISABLED. Both sync and async lifecycle paths
+  participate; the cron path is defensive (no-op when the task has no .cron attribute —
+  pyworkflowy.Task doesn't yet).
+
+Hosts can drop their _wire_task / attach_scheduler / wire_pending_triggers boilerplate.
+
+- **tasks**: Ctx.task(metadata=...) + PluginTaskInfo return shape
+  ([`1839b0d`](https://github.com/KilianSen/pyPlugy/commit/1839b0da515c9ef61610f5d9f9bd109bfb6efd91))
+
+ctx.task accepts an optional metadata mapping that pyplugy stores verbatim alongside the underlying
+  task; ctx.tasks and PluginManager.plugin_tasks(name) now return tuple[PluginTaskInfo, ...] so
+  hosts can round-trip from a plugin name back to the actual task objects + their host metadata.
+  Internal storage slot renamed _tasks → _task_infos to reflect the type shift.
+
+PluginInfo.tasks still returns task names; will be bumped to PluginTaskInfo in a follow-up commit.
+
+BREAKING CHANGE: PluginManager.plugin_tasks(name) returns tuple[PluginTaskInfo, ...] instead of
+  list[str]. Use [i.task.name for i in manager.plugin_tasks(name)] for the prior shape.
+  PluginContext.tasks shape changes identically.
+
+- **tasks**: Plugininfo.tasks tuple[PluginTaskInfo, ...]; dump serializes name+metadata
+  ([`ab159e6`](https://github.com/KilianSen/pyPlugy/commit/ab159e6e57a59d6c1ede4b6f5be4e1a485c43d05))
+
+PluginInfo.tasks now carries the rich PluginTaskInfo entries instead of bare names, matching the new
+  ctx.tasks / plugin_tasks shape. PluginManager.dump() serializes each entry as {"name": ...,
+  "metadata": ...} so the JSON snapshot stays machine-readable.
+
+BREAKING CHANGE: PluginInfo.tasks is now tuple[PluginTaskInfo, ...] instead of tuple[str, ...].
+
+- **tasks**: Widen SchedulerProtocol with bind_tasks and cancel
+  ([`ecf2d83`](https://github.com/KilianSen/pyPlugy/commit/ecf2d83bc5a360ae1d19e1eeb0dd590c7794ad5a))
+
+SchedulerProtocol now requires bind_tasks(*tasks) and cancel(job) — the surface the manager needs to
+  auto-wire trigger-driven tasks at enable time and tear them down at disable. pyworkflowy.Scheduler
+  already satisfies both. FakeScheduler/FakeTask in conftest grow matching test doubles
+  (FakeTask.triggers, FakeScheduler.bound/cancelled).
+
+### Testing
+
+- **tasks**: Real-pyworkflowy end-to-end for triggers auto-wire
+  ([`a151afe`](https://github.com/KilianSen/pyPlugy/commit/a151afee1e4b5af86ff7713ba40c8b0848a44a45))
+
+Proves the protocol surface pyplugy declares matches pyworkflowy's real Scheduler — declaring
+  triggers via ctx.task auto-registers an event-driven job, and disable cancels it.
 
 
 ## v0.3.0 (2026-05-24)
