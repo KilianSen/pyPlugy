@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from pyplugy._context import PluginContext
+    from pyplugy._task_info import PluginTaskInfo
 
 
 __all__ = [
@@ -127,7 +128,7 @@ class PluginInfo:
     author: str
     tags: tuple[str, ...]
     targets: tuple[str, ...]
-    tasks: tuple[str, ...]
+    tasks: tuple[PluginTaskInfo, ...]
 
 
 _NAME_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
@@ -367,7 +368,7 @@ def _info_for(
     *,
     state: PluginState,
     targets: tuple[str, ...],
-    tasks: tuple[str, ...],
+    tasks: tuple[PluginTaskInfo, ...],
 ) -> PluginInfo:
     m = plugin_obj.manifest
     return PluginInfo(

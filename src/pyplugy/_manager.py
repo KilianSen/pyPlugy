@@ -656,10 +656,7 @@ class PluginManager:
         out: list[PluginInfo] = []
         for slot in slots:
             targets = tuple(self.plugin_targets(slot.plugin.manifest.name))
-            tasks = tuple(
-                getattr(i.task, "name", repr(i.task))
-                for i in self.plugin_tasks(slot.plugin.manifest.name)
-            )
+            tasks = self.plugin_tasks(slot.plugin.manifest.name)
             out.append(_info_for(slot.plugin, state=slot.state, targets=targets, tasks=tasks))
         return out
 
@@ -679,7 +676,10 @@ class PluginManager:
                     "author": info.author,
                     "tags": list(info.tags),
                     "targets": list(info.targets),
-                    "tasks": list(info.tasks),
+                    "tasks": [
+                        {"name": getattr(t.task, "name", repr(t.task)), "metadata": dict(t.metadata)}
+                        for t in info.tasks
+                    ],
                 }
                 for info in self.list_plugins()
             ],

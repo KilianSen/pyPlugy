@@ -173,7 +173,7 @@ def test_ctx_task_accepts_taskbase_subclass(manager: PluginManager) -> None:
     assert captured["task"] is not None
     # Task is stored on the context.
     info = next(p for p in manager.list_plugins() if p.name == "tb")
-    assert info.tasks == ("cleanup",)
+    assert [i.task.name for i in info.tasks] == ["cleanup"]
 
 
 # ---------- type-hint dep injection ----------
