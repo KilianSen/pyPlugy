@@ -127,6 +127,39 @@ def test_class_plugin_with_real_pyworkflowy() -> None:
     assert captured["run"].is_async is True
 
 
+def test_real_pyworkflowy_triggers_auto_wired() -> None:
+    """End-to-end: declare triggers in ctx.task, pyplugy auto-binds via real Scheduler."""
+    from collections.abc import Callable, Mapping
+
+    scheduler = Scheduler()
+
+    class _NoopEventSource:
+        def subscribe(
+            self,
+            event_name: str,
+            handler: Callable[[Mapping[str, Any]], None],
+        ) -> Callable[[], None]:
+            return lambda: None
+
+    scheduler.bind_event_source(_NoopEventSource())
+
+    manager = PluginManager(tasky=pyworkflowy, scheduler=scheduler)
+
+    @plugin("triggered", version="1.0.0")
+    def setup(ctx: PluginContext) -> None:
+        @ctx.task(triggers=("book.added",))
+        def handle(book_id: str = "") -> str:
+            return book_id
+
+    manager.load(setup)
+
+    assert sum(1 for j in scheduler.jobs() if j.is_event_driven) == 1
+
+    manager.disable("triggered")
+
+    assert all(j.cancelled for j in scheduler.jobs() if j.is_event_driven)
+
+
 def test_unload_clears_hooks_alongside_tasks() -> None:
     """The headline integration win: one unload tears down hooks AND tasks."""
     from pyhooky import HookRegistry
