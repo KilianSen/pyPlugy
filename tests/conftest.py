@@ -22,6 +22,9 @@ class FakeTask:
         self.fn = fn
         self.name = getattr(fn, "__name__", repr(fn))
         self.opts = opts
+        # pyworkflowy.Task surface that bind_tasks reads.
+        self.triggers: tuple[str, ...] = tuple(opts.get("triggers", ()))
+        self.payload_map: tuple[tuple[str, str], ...] = tuple(opts.get("payload_map", ()))
 
     def submit(self, *args: Any, **kwargs: Any) -> FakeTaskHandle:
         return FakeTaskHandle(self.name)
@@ -49,10 +52,20 @@ class FakeTasky:
         return decorator
 
 
+class _FakeJob:
+    __slots__ = ("task", "trigger")
+
+    def __init__(self, task: Any, *, trigger: str | None = None) -> None:
+        self.task = task
+        self.trigger = trigger
+
+
 class FakeScheduler:
     def __init__(self) -> None:
         self.started = False
         self.calls: list[tuple[str, Any]] = []
+        self.bound: list[Any] = []
+        self.cancelled: list[Any] = []
 
     def every(self, interval: Any) -> Any:
         self.calls.append(("every", interval))
@@ -64,7 +77,20 @@ class FakeScheduler:
 
     def do(self, task: Any) -> Any:
         self.calls.append(("do", task))
-        return self
+        return _FakeJob(task)
+
+    def bind_tasks(self, *tasks: Any) -> list[Any]:
+        jobs: list[_FakeJob] = []
+        for t in tasks:
+            for trigger in getattr(t, "triggers", ()) or ():
+                job = _FakeJob(t, trigger=trigger)
+                jobs.append(job)
+                self.bound.append(job)
+        return jobs
+
+    def cancel(self, job: Any) -> bool:
+        self.cancelled.append(job)
+        return True
 
     def start(self) -> None:
         self.started = True

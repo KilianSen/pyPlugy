@@ -71,14 +71,23 @@ class SchedulerProtocol(Protocol):
     host application's job.
 
     ``every`` accepts whatever the concrete scheduler accepts (pyWorkflowy's takes
-    ``float | timedelta``); ``cron`` takes a cron expression string. Typed as
-    ``Any`` so the protocol stays loose enough for stubs and mocks.
+    ``float | timedelta``); ``cron`` takes a cron expression string.
+    ``bind_tasks`` auto-binds any task whose ``triggers`` attribute is non-empty
+    and returns the created job objects so the manager can cancel them on
+    disable. ``cancel`` accepts whatever ``bind_tasks`` returned; pyWorkflowy
+    uses ``ScheduledJob``, but the protocol stays loose.
     """
 
     def every(self, interval: Any) -> Any:  # pragma: no cover
         ...
 
     def cron(self, expression: str) -> Any:  # pragma: no cover
+        ...
+
+    def bind_tasks(self, *tasks: Any) -> list[Any]:  # pragma: no cover
+        ...
+
+    def cancel(self, job: Any) -> bool:  # pragma: no cover
         ...
 
     def start(self) -> None:  # pragma: no cover
