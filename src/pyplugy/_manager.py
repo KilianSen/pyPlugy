@@ -1047,6 +1047,61 @@ class PluginManager:
                 ctx._events[key] = HookPoint(target, schema, registry=self._hooks_registry)
         return ctx
 
+    def _wire_scheduled_tasks(self, plugin: Plugin) -> None:
+        """Bind any task with triggers / cron to the scheduler.
+
+        Called from ``_do_enable`` / ``_ado_enable`` after ``on_enable`` has
+        run. No-op when the manager has no scheduler configured, or when
+        the plugin registered no tasks with triggers or cron.
+
+        Jobs returned by the scheduler are stored on ``_scheduled_jobs`` so
+        :meth:`_unwire_scheduled_tasks` can cancel them on disable.
+        """
+        scheduler = self._scheduler
+        if scheduler is None:
+            return
+        name = plugin.manifest.name
+        slot = self._plugins.get(name)
+        if slot is None:
+            return
+        triggered: list[Any] = []
+        cron_pairs: list[tuple[str, Any]] = []
+        for info in slot.ctx.tasks:
+            task = info.task
+            if getattr(task, "triggers", None):
+                triggered.append(task)
+            cron_expr = getattr(task, "cron", None)
+            if cron_expr:
+                cron_pairs.append((cron_expr, task))
+        jobs: list[Any] = []
+        if triggered:
+            jobs.extend(scheduler.bind_tasks(*triggered))
+        for expr, task in cron_pairs:
+            jobs.append(scheduler.cron(expr).do(task))
+        if jobs:
+            self._scheduled_jobs.setdefault(name, []).extend(jobs)
+
+    def _unwire_scheduled_tasks(self, plugin: Plugin) -> None:
+        """Cancel jobs registered for ``plugin`` and clear bookkeeping.
+
+        Called from ``_do_disable`` / ``_ado_disable`` before the task list
+        is cleared. Safe to call when ``_scheduler`` is None or no jobs
+        were registered.
+        """
+        if self._scheduler is None:
+            return
+        jobs = self._scheduled_jobs.pop(plugin.manifest.name, None)
+        if not jobs:
+            return
+        for job in jobs:
+            try:
+                self._scheduler.cancel(job)
+            except Exception:
+                _logger.exception(
+                    "pyplugy: scheduler.cancel() raised for plugin %r — continuing",
+                    plugin.manifest.name,
+                )
+
     @staticmethod
     def _reject_coroutine(result: Any, name: str, op: str) -> None:
         """Sync lifecycle path — surface coroutine returns instead of silently leaking them."""
@@ -1109,6 +1164,7 @@ class PluginManager:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginLoadError(f"on_enable failed for plugin {name!r}: {exc}") from exc
             slot.state = PluginState.ENABLED
+            self._wire_scheduled_tasks(plugin)
             self._hooks_registry.trigger(HOOK_PLUGIN_ENABLE, plugin)
         finally:
             _current_manager.reset(token)
@@ -1130,6 +1186,7 @@ class PluginManager:
                     raise PluginLoadError(f"on_disable failed for plugin {name!r}: {exc}") from exc
             removed = self._hooks_registry.clear_tag(name)
             _logger.debug("pyplugy: disabled %r — cleared %d hook(s)", name, len(removed))
+            self._unwire_scheduled_tasks(plugin)
             slot.ctx._task_infos.clear()
             slot.state = PluginState.DISABLED
             self._hooks_registry.trigger(HOOK_PLUGIN_DISABLE, plugin)
@@ -1214,6 +1271,7 @@ class PluginManager:
                     self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                     raise PluginLoadError(f"on_enable failed for plugin {name!r}: {exc}") from exc
             slot.state = PluginState.ENABLED
+            self._wire_scheduled_tasks(plugin)
             self._hooks_registry.trigger(HOOK_PLUGIN_ENABLE, plugin)
         finally:
             _current_manager.reset(token)
@@ -1234,6 +1292,7 @@ class PluginManager:
                     raise PluginLoadError(f"on_disable failed for plugin {name!r}: {exc}") from exc
             removed = self._hooks_registry.clear_tag(name)
             _logger.debug("pyplugy: disabled %r — cleared %d hook(s)", name, len(removed))
+            self._unwire_scheduled_tasks(plugin)
             slot.ctx._task_infos.clear()
             slot.state = PluginState.DISABLED
             self._hooks_registry.trigger(HOOK_PLUGIN_DISABLE, plugin)
