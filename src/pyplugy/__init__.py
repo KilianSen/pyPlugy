@@ -20,6 +20,7 @@ from pyplugy._plugin import (
     PluginState,
     plugin,
 )
+from pyplugy._task_info import PluginTaskInfo
 from pyplugy.exceptions import (
     PluginAlreadyLoadedError,
     PluginConfigValidationError,
@@ -57,6 +58,7 @@ __all__ = [
     "PluginNotFoundError",
     "PluginPeerDependencyError",
     "PluginState",
+    "PluginTaskInfo",
     "PluginUnloadError",
     "current_context",
     "current_manager",
