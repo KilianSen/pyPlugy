@@ -436,7 +436,8 @@ You can list a plugin's targets / tasks with:
 
 ```python
 manager.plugin_targets("audit")   # ["checkout", "checkout:step", ...]
-manager.plugin_tasks("audit")     # ["periodic_flush", ...]
+manager.plugin_tasks("audit")     # (PluginTaskInfo(task=<Task name='periodic_flush'>, metadata={}), ...)
+[i.task.name for i in manager.plugin_tasks("audit")]  # ["periodic_flush", ...]
 ```
 
 ## Manager-level hooks
@@ -494,6 +495,38 @@ The `TaskBase`-class form is self-contained (it bypasses the `tasky=`
 requirement) and works on any manager. pyPlugy itself only depends on a
 small `typing.Protocol` defined in `pyplugy._tasky_protocol`, so the
 `tasky=` argument can be a stub for tests.
+
+### Triggers auto-wire on enable
+
+A task declared with `triggers=` is bound to the scheduler automatically when
+the plugin is enabled, and cancelled on disable — no host-side wiring needed:
+
+```python
+@plugin("reactive", version="0.1.0")
+def setup(ctx):
+    @ctx.task(triggers=("book.added",), payload_map={"book_id": "book_id"})
+    def on_book_added(book_id: str) -> None:
+        ...
+```
+
+The manager calls `scheduler.bind_tasks(...)` for every task with a non-empty
+`triggers` attribute, and `scheduler.cancel(job)` for each on disable.
+
+### Host metadata
+
+`ctx.task(metadata={...})` attaches data the host reads back via
+`PluginManager.plugin_tasks(name)`. pyPlugy never inspects it — useful when
+the host wants to surface a task's category, priority, or input schema in
+its admin UI without subclassing the context:
+
+```python
+@ctx.task(metadata={"category": "reactive", "priority": 5})
+def handler() -> None: ...
+
+# Host code:
+for info in manager.plugin_tasks("reactive"):
+    print(info.task.name, info.metadata)
+```
 
 ## Errors
 

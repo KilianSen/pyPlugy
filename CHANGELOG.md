@@ -1,6 +1,28 @@
 # CHANGELOG
 
 
+## v0.4.0 (UNRELEASED)
+
+### Features
+
+- `ctx.task(metadata={...})` attaches host-specific data to a registered task,
+  surfaced via `ctx.tasks` and `PluginManager.plugin_tasks(name)`.
+- `PluginManager` auto-binds tasks with non-empty `triggers` to the scheduler
+  on `enable()` and cancels the bound jobs on `disable()`.
+
+### Breaking changes
+
+- `PluginContext.tasks` now returns `tuple[PluginTaskInfo, ...]` instead of
+  the raw task objects. Read `info.task` for the underlying task.
+- `PluginManager.plugin_tasks(name)` now returns `tuple[PluginTaskInfo, ...]`
+  instead of `list[str]`. Use `[i.task.name for i in manager.plugin_tasks(name)]`
+  for the prior shape.
+- `PluginInfo.tasks` is now `tuple[PluginTaskInfo, ...]`. `PluginManager.dump()`
+  serialises each entry as `{"name": ..., "metadata": ...}`.
+- `SchedulerProtocol` widened: implementations must expose `bind_tasks(*tasks)`
+  and `cancel(job)`. pyWorkflowy's `Scheduler` already satisfies both.
+
+
 ## v0.3.0 (2026-05-24)
 
 ### Features
