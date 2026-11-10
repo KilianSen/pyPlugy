@@ -1,6 +1,28 @@
 # CHANGELOG
 
 
+## v0.5.0 (2026-11-10)
+
+### Bug Fixes
+
+- **types**: Allow async and injected callables in @plugin decorator overloads
+  ([`1970481`](https://github.com/KilianSen/pyPlugy/commit/1970481505bbefb7cfa3e3910163bc256f7d1baa))
+
+### Features
+
+- **slots,discovery**: Add named slots, non-executing discovery, host versioning, and fault
+  tolerance
+  ([`a449f50`](https://github.com/KilianSen/pyPlugy/commit/a449f50792d194b4bdab9424f816760c5db96c50))
+
+- Add named slots and provider lookup (Plugin.slots, @plugin(slots=...), ctx.provide, ctx.slot,
+  manager.get_slot, manager.get_slots, manager.aget_slot, manager.aget_slots) - Add non-executing
+  discovery (discover, discover_module, discover_entry_points, discover_directory) with UNLOADED
+  state and lazy auto-activation - Add host API version gating via host_requires and
+  PluginManager(host_version=..., host_name=...) - Add fault-tolerant loading
+  (on_error='raise'|'skip'|'warn') with error tracking and isolated failure pruning - Update
+  documentation and add comprehensive test suite
+
+
 ## v0.4.0 (2026-05-26)
 
 ### Chores
