@@ -404,7 +404,7 @@ class _DecoratedPlugin(Plugin):
     def __init__(
         self,
         manifest: PluginManifest,
-        setup: Callable[[PluginContext], None],
+        setup: Callable[..., Any],
         *,
         declarative_slots: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
@@ -416,7 +416,7 @@ class _DecoratedPlugin(Plugin):
 
 
 @overload
-def plugin(name: Callable[..., None], /) -> Plugin: ...
+def plugin(name: Callable[..., Any], /) -> Plugin: ...
 @overload
 def plugin(
     name: str,
@@ -431,9 +431,9 @@ def plugin(
     author: str = ...,
     tags: tuple[str, ...] | list[str] | None = ...,
     slots: Mapping[str, Mapping[str, Any]] | None = ...,
-) -> Callable[[Callable[..., None]], Plugin]: ...
+) -> Callable[[Callable[..., Any]], Plugin]: ...
 def plugin(
-    name: str | Callable[[PluginContext], None],
+    name: str | Callable[..., Any],
     *,
     version: str = "0.0.0",
     requires: tuple[str, ...] | list[str] | None = None,
@@ -445,7 +445,7 @@ def plugin(
     author: str = "",
     tags: tuple[str, ...] | list[str] | None = None,
     slots: Mapping[str, Mapping[str, Any]] | None = None,
-) -> Plugin | Callable[[Callable[[PluginContext], None]], Plugin]:
+) -> Plugin | Callable[[Callable[..., Any]], Plugin]:
     """Wrap a ``setup(ctx)`` callable into a :class:`Plugin`.
 
     Two call styles::
