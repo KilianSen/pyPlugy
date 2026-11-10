@@ -25,12 +25,15 @@ if TYPE_CHECKING:
     from pyhooky import HookRegistry
 
     from pyplugy._plugin import PluginManifest
+    from pyplugy._slot_info import PluginSlotInfo
     from pyplugy._task_info import PluginTaskInfo
     from pyplugy._tasky_protocol import SchedulerProtocol, TaskyProtocol
 
 
 __all__ = ["PluginContext", "current_context"]
 
+
+_UNSET: Any = object()
 
 _current_context: ContextVar[PluginContext | None] = ContextVar(
     "pyplugy_current_context", default=None
@@ -97,6 +100,7 @@ class PluginContext:
         "_manifest",
         "_registry",
         "_scheduler",
+        "_slot_infos",
         "_task_infos",
         "_tasky",
     )
@@ -122,6 +126,7 @@ class PluginContext:
             self._config = dict(config or {})
         self._tasky = tasky
         self._scheduler = scheduler
+        self._slot_infos: list[PluginSlotInfo] = []
         self._task_infos: list[PluginTaskInfo] = []
         self._logger = logging.getLogger(f"pyplugy.{manifest.name}")
         # Populated by the manager once it has the Plugin instance and can
@@ -193,6 +198,15 @@ class PluginContext:
         object and the host-supplied ``metadata`` mapping (empty by default).
         """
         return tuple(self._task_infos)
+
+    @property
+    def slots(self) -> tuple[PluginSlotInfo, ...]:
+        """Slot providers registered by this plugin (declarative + dynamic).
+
+        Each entry is a :class:`PluginSlotInfo` carrying ``slot``, ``name``,
+        ``provider``, ``plugin``, and ``metadata``.
+        """
+        return tuple(self._slot_infos)
 
     # ---------- hook passthroughs ----------
 
@@ -448,6 +462,107 @@ class PluginContext:
 
         # Mixed form: `ctx.task(fn, retries=3)` — uncommon but legal.
         return _record(decorator(fn, **kwargs))
+
+    # ---------- named slot providers ----------
+
+    def provide(
+        self,
+        slot: str,
+        name: Any = _UNSET,
+        provider: Any = _UNSET,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Register a named provider under ``slot`` for this plugin.
+
+        Supports both direct registration and decorator call styles::
+
+            # Direct registration
+            ctx.provide("hair", "v2", v2_mesher)
+
+            # Decorator with explicit provider name
+            @ctx.provide("fix", "dead")
+            def fix_dead(mesh): ...
+
+            # Decorator inferring the provider name from ``fn.__name__``
+            @ctx.provide("fix")
+            def rings(mesh): ...
+
+        Raises :class:`PluginSlotConflictError` if another plugin has already
+        claimed ``(slot, name)`` on the active manager.
+        """
+        from types import MappingProxyType
+
+        from pyplugy._manager import current_manager
+        from pyplugy._slot_info import _EMPTY_METADATA, PluginSlotInfo
+        from pyplugy.exceptions import PluginManifestError, PluginSlotConflictError
+
+        if not isinstance(slot, str) or not slot:
+            raise PluginManifestError(f"slot name must be a non-empty string, got {slot!r}")
+
+        md: Mapping[str, Any] = MappingProxyType(dict(metadata)) if metadata else _EMPTY_METADATA
+
+        def _record(entry_name: str, obj: Any) -> Any:
+            if not isinstance(entry_name, str) or not entry_name:
+                raise PluginManifestError(
+                    f"provider name in slot {slot!r} must be a non-empty string, got {entry_name!r}"
+                )
+            manager = current_manager()
+            if manager is not None:
+                owner = manager._slot_owner(slot, entry_name, exclude_plugin=self._manifest.name)
+                if owner is not None:
+                    raise PluginSlotConflictError(
+                        f"slot ({slot!r}, {entry_name!r}) is already claimed by plugin {owner!r}; "
+                        f"plugin {self._manifest.name!r} cannot also provide it",
+                        slot=slot,
+                        name=entry_name,
+                        existing_plugin=owner,
+                        new_plugin=self._manifest.name,
+                    )
+            info = PluginSlotInfo(
+                slot=slot,
+                name=entry_name,
+                provider=obj,
+                plugin=self._manifest.name,
+                metadata=md,
+            )
+            for idx, existing in enumerate(self._slot_infos):
+                if existing.slot == slot and existing.name == entry_name:
+                    self._slot_infos[idx] = info
+                    return obj
+            self._slot_infos.append(info)
+            return obj
+
+        # 1) `@ctx.provide("fix")` — decorator inferring name from fn.__name__
+        if name is _UNSET and provider is _UNSET:
+
+            def _decorate_inferred(fn: Callable[..., Any]) -> Any:
+                return _record(getattr(fn, "__name__", ""), fn)
+
+            return _decorate_inferred
+
+        # 2) `ctx.provide("fix", fn)` — direct callable passing without explicit name
+        if callable(name) and not isinstance(name, str) and provider is _UNSET:
+            return _record(getattr(name, "__name__", ""), name)
+
+        # 3) `@ctx.provide("fix", "dead")` — decorator with explicit name
+        if isinstance(name, str) and provider is _UNSET:
+
+            def _decorate_named(fn: Callable[..., Any]) -> Any:
+                return _record(name, fn)
+
+            return _decorate_named
+
+        # 4) `ctx.provide("hair", "v2", v2_mesher)` — explicit name + provider (including None)
+        if isinstance(name, str):
+            return _record(name, provider)
+
+        raise PluginManifestError(
+            f"invalid ctx.provide call for slot {slot!r}: expected "
+            "(slot, name, provider) or @ctx.provide(slot[, name])"
+        )
+
+    slot = provide
 
     # ---------- introspection ----------
 

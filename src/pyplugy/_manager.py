@@ -26,14 +26,21 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 import threading
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 
 from pyhooky import HookRegistry, get_default_registry, tag_scope
 
 from pyplugy._context import PluginContext, _activate, _validate_against_model
-from pyplugy._depgraph import compute_reverse_graph, parse_requirement, resolve_load_order
+from pyplugy._depgraph import (
+    check_host_requirement,
+    compute_reverse_graph,
+    parse_requirement,
+    resolve_load_order,
+)
 from pyplugy._discovery import (
     import_file,
     iter_directory_modules,
@@ -41,20 +48,24 @@ from pyplugy._discovery import (
     scan_module,
 )
 from pyplugy._plugin import Plugin, PluginInfo, PluginState, _DecoratedPlugin, _info_for
+from pyplugy._slot_info import PluginSlotInfo
 from pyplugy.exceptions import (
     PluginAlreadyLoadedError,
     PluginConfigValidationError,
+    PluginConflictError,
     PluginDependencyError,
     PluginError,
     PluginLoadError,
     PluginManifestError,
     PluginMissingDependencyError,
     PluginNotFoundError,
+    PluginSlotConflictError,
+    PluginSlotNotFoundError,
     PluginUnloadError,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
     from pathlib import Path
     from types import ModuleType
 
@@ -62,6 +73,21 @@ if TYPE_CHECKING:
     from pyplugy._tasky_protocol import SchedulerProtocol, TaskyProtocol
 
     PluginResolver = Callable[[str], "list[Plugin] | None"]
+
+OnLoadError = Literal["raise", "skip", "warn"]
+LoadFailurePhase = Literal["discovery", "plan", "load", "enable"]
+
+_UNSET: Any = object()
+
+
+@dataclass(frozen=True, slots=True)
+class PluginLoadFailure:
+    """Recorded when a plugin fails discovery, planning, or lifecycle under skip/warn mode."""
+
+    source: str
+    error: Exception
+    phase: LoadFailurePhase
+    plugin: Plugin | None = None
 
 
 __all__ = [
@@ -71,6 +97,9 @@ __all__ = [
     "HOOK_PLUGIN_ERROR",
     "HOOK_PLUGIN_LOAD",
     "HOOK_PLUGIN_UNLOAD",
+    "LoadFailurePhase",
+    "OnLoadError",
+    "PluginLoadFailure",
     "PluginManager",
     "current_manager",
 ]
@@ -162,7 +191,11 @@ class PluginManager:
         "_configs",
         "_context_class",
         "_hooks_registry",
+        "_host_name",
+        "_host_version",
+        "_load_errors",
         "_lock",
+        "_on_load_error",
         "_plugins",
         "_resolver_max_rounds",
         "_resolvers",
@@ -180,7 +213,14 @@ class PluginManager:
         configs: Mapping[str, Mapping[str, Any]] | None = None,
         context_class: Callable[..., PluginContext] = PluginContext,
         resolver_max_rounds: int = 10,
+        host_version: str | None = None,
+        host_name: str | None = None,
+        on_load_error: OnLoadError = "raise",
     ) -> None:
+        if on_load_error not in ("raise", "skip", "warn"):
+            raise ValueError(
+                f"on_load_error must be 'raise', 'skip', or 'warn', got {on_load_error!r}"
+            )
         self._hooks_registry: HookRegistry = registry or get_default_registry()
         self._tasky = tasky
         self._scheduler = scheduler
@@ -193,6 +233,10 @@ class PluginManager:
         self._resolvers: list[PluginResolver] = []
         self._resolver_max_rounds = resolver_max_rounds
         self._scheduled_jobs: dict[str, list[Any]] = {}
+        self._host_version = host_version
+        self._host_name = host_name
+        self._on_load_error: OnLoadError = on_load_error
+        self._load_errors: list[PluginLoadFailure] = []
 
     # ---------- public properties ----------
 
@@ -208,6 +252,113 @@ class PluginManager:
     @property
     def scheduler(self) -> SchedulerProtocol | None:
         return self._scheduler
+
+    @property
+    def host_version(self) -> str | None:
+        """The host application version used to validate ``manifest.host_requires``."""
+        return self._host_version
+
+    @property
+    def host_name(self) -> str | None:
+        """The optional host application name used to validate ``manifest.host_requires``."""
+        return self._host_name
+
+    @property
+    def on_load_error(self) -> OnLoadError:
+        """Default error policy (``'raise'``, ``'skip'``, or ``'warn'``) for batch loads."""
+        return self._on_load_error
+
+    def load_errors(self) -> list[PluginLoadFailure]:
+        """Return failures recorded under ``on_error='skip'|'warn'``."""
+        with self._lock:
+            return list(self._load_errors)
+
+    def clear_load_errors(self) -> None:
+        """Clear the list of recorded load failures."""
+        with self._lock:
+            self._load_errors.clear()
+
+    # ---------- non-executing discovery ----------
+
+    def discover(
+        self,
+        target: Any,
+        *,
+        on_error: OnLoadError | None = None,
+    ) -> list[Plugin]:
+        """Scan ``target`` and register discovered plugins in ``UNLOADED`` state.
+
+        Does **not** run ``on_load`` or ``on_enable`` — useful for CLI listing
+        (e.g. ``vrs plugins``) and declarative slot inspection without executing
+        plugin setup code.
+        """
+        mode = self._resolve_error_mode(on_error)
+        try:
+            plugins = self._coerce_to_plugins(target)
+        except Exception as exc:
+            if mode == "raise":
+                raise
+            self._record_failure(
+                source=str(target),
+                error=exc,
+                phase="discovery",
+                plugin=None,
+                mode=mode,
+            )
+            return []
+        return self._register_discovered(plugins, mode=mode)
+
+    def discover_module(
+        self,
+        module: ModuleType,
+        *,
+        on_error: OnLoadError | None = None,
+    ) -> list[Plugin]:
+        """Scan ``module`` and register discovered plugins in ``UNLOADED`` state."""
+        mode = self._resolve_error_mode(on_error)
+        try:
+            plugins = scan_module(module)
+        except Exception as exc:
+            if mode == "raise":
+                raise
+            self._record_failure(
+                source=getattr(module, "__name__", repr(module)),
+                error=exc,
+                phase="discovery",
+                plugin=None,
+                mode=mode,
+            )
+            return []
+        return self._register_discovered(plugins, mode=mode)
+
+    def discover_entry_points(
+        self,
+        group: str,
+        *,
+        on_error: OnLoadError | None = None,
+    ) -> list[Plugin]:
+        """Scan every entry point in ``group`` and register plugins in ``UNLOADED`` state."""
+        mode = self._resolve_error_mode(on_error)
+        collected = self._collect_entry_points(group, mode=mode)
+        return self._register_discovered(collected, mode=mode)
+
+    def discover_directory(
+        self,
+        path: Path,
+        *,
+        recursive: bool = False,
+        pattern: str = "*.py",
+        on_error: OnLoadError | None = None,
+    ) -> list[Plugin]:
+        """Scan files under ``path`` and register discovered plugins in ``UNLOADED`` state."""
+        mode = self._resolve_error_mode(on_error)
+        collected = self._collect_directory(
+            path,
+            recursive=recursive,
+            pattern=pattern,
+            mode=mode,
+        )
+        return self._register_discovered(collected, mode=mode)
 
     # ---------- loading helpers ----------
 
@@ -230,38 +381,122 @@ class PluginManager:
         plugins = self._coerce_to_plugins(target)
         if not plugins:
             raise PluginLoadError(f"no plugins found in target {target!r}")
-        loaded = self.load_all(plugins, enable=enable)
+        loaded = self.load_all(plugins, enable=enable, on_error="raise")
         return loaded[0]
 
-    def load_all(self, plugins: list[Plugin], *, enable: bool = True) -> list[Plugin]:
+    def load_all(
+        self,
+        plugins: list[Plugin],
+        *,
+        enable: bool = True,
+        on_error: OnLoadError | None = None,
+    ) -> list[Plugin]:
         """Load several plugins in dependency order."""
-        ordered = self._plan_load(plugins)
+        mode = self._resolve_error_mode(on_error)
+        ordered = self._plan_load(plugins, mode=mode)
+        if mode == "raise":
+            for p in ordered:
+                self._do_load(p)
+                if enable:
+                    self._do_enable(p)
+            return ordered
+
+        loaded: list[Plugin] = []
+        failed_names: set[str] = set()
         for p in ordered:
-            self._do_load(p)
+            name = p.manifest.name
+            missing_dep = self._first_failed_dep(p, failed_names)
+            if missing_dep is not None:
+                failed_names.add(name)
+                with self._lock:
+                    self._plugins.pop(name, None)
+                dep_exc = PluginDependencyError(
+                    f"plugin {name!r} skipped because required dependency "
+                    f"{missing_dep!r} failed to load",
+                    consumer=name,
+                )
+                self._record_failure(
+                    source=name,
+                    error=dep_exc,
+                    phase="load",
+                    plugin=p,
+                    mode=mode,
+                )
+                continue
+            try:
+                self._do_load(p)
+            except Exception as exc:
+                failed_names.add(name)
+                self._record_failure(
+                    source=name,
+                    error=exc,
+                    phase="load",
+                    plugin=p,
+                    mode=mode,
+                    trigger_hook=False,
+                )
+                continue
             if enable:
-                self._do_enable(p)
-        return ordered
+                try:
+                    self._do_enable(p)
+                except Exception as exc:
+                    failed_names.add(name)
+                    self._hooks_registry.clear_tag(name)
+                    with self._lock:
+                        self._plugins.pop(name, None)
+                    self._record_failure(
+                        source=name,
+                        error=exc,
+                        phase="enable",
+                        plugin=p,
+                        mode=mode,
+                        trigger_hook=False,
+                    )
+                    continue
+            loaded.append(p)
+        return loaded
 
-    def load_all_from_module(self, module: ModuleType, *, enable: bool = True) -> list[Plugin]:
+    def load_all_from_module(
+        self,
+        module: ModuleType,
+        *,
+        enable: bool = True,
+        on_error: OnLoadError | None = None,
+    ) -> list[Plugin]:
         """Scan ``module`` for plugins and load every one found."""
-        return self.load_all(scan_module(module), enable=enable)
+        mode = self._resolve_error_mode(on_error)
+        try:
+            plugins = scan_module(module)
+        except Exception as exc:
+            if mode == "raise":
+                raise
+            self._record_failure(
+                source=getattr(module, "__name__", repr(module)),
+                error=exc,
+                phase="discovery",
+                plugin=None,
+                mode=mode,
+            )
+            return []
+        return self.load_all(plugins, enable=enable, on_error=mode)
 
-    def load_entry_points(self, group: str, *, enable: bool = True) -> list[Plugin]:
+    def load_entry_points(
+        self,
+        group: str,
+        *,
+        enable: bool = True,
+        on_error: OnLoadError | None = None,
+    ) -> list[Plugin]:
         """Load plugins from every entry point in ``group``.
 
         Each entry point's module is scanned via :func:`scan_module`. Entry
         points that fail to load raise :class:`PluginLoadError` with the
-        underlying exception chained.
+        underlying exception chained (unless ``on_error`` is ``'skip'`` or
+        ``'warn'``).
         """
-        collected: list[Plugin] = []
-        for ep_name, module in iter_entry_points(group):
-            try:
-                collected.extend(scan_module(module))
-            except Exception as exc:
-                raise PluginLoadError(
-                    f"failed to scan entry point {ep_name!r} (group {group!r}): {exc}"
-                ) from exc
-        return self.load_all(collected, enable=enable)
+        mode = self._resolve_error_mode(on_error)
+        collected = self._collect_entry_points(group, mode=mode)
+        return self.load_all(collected, enable=enable, on_error=mode)
 
     def load_directory(
         self,
@@ -270,12 +505,17 @@ class PluginManager:
         recursive: bool = False,
         pattern: str = "*.py",
         enable: bool = True,
+        on_error: OnLoadError | None = None,
     ) -> list[Plugin]:
         """Import every matching file under ``path`` and load discovered plugins."""
-        collected: list[Plugin] = []
-        for module in iter_directory_modules(path, recursive=recursive, pattern=pattern):
-            collected.extend(scan_module(module))
-        return self.load_all(collected, enable=enable)
+        mode = self._resolve_error_mode(on_error)
+        collected = self._collect_directory(
+            path,
+            recursive=recursive,
+            pattern=pattern,
+            mode=mode,
+        )
+        return self.load_all(collected, enable=enable, on_error=mode)
 
     # ---------- async loading helpers ----------
 
@@ -284,35 +524,116 @@ class PluginManager:
         plugins = self._coerce_to_plugins(target)
         if not plugins:
             raise PluginLoadError(f"no plugins found in target {target!r}")
-        loaded = await self.aload_all(plugins, enable=enable)
+        loaded = await self.aload_all(plugins, enable=enable, on_error="raise")
         return loaded[0]
 
-    async def aload_all(self, plugins: list[Plugin], *, enable: bool = True) -> list[Plugin]:
+    async def aload_all(
+        self,
+        plugins: list[Plugin],
+        *,
+        enable: bool = True,
+        on_error: OnLoadError | None = None,
+    ) -> list[Plugin]:
         """Async variant of :meth:`load_all`."""
-        ordered = self._plan_load(plugins)
+        mode = self._resolve_error_mode(on_error)
+        ordered = self._plan_load(plugins, mode=mode)
+        if mode == "raise":
+            for p in ordered:
+                await self._ado_load(p)
+                if enable:
+                    await self._ado_enable(p)
+            return ordered
+
+        loaded: list[Plugin] = []
+        failed_names: set[str] = set()
         for p in ordered:
-            await self._ado_load(p)
+            name = p.manifest.name
+            missing_dep = self._first_failed_dep(p, failed_names)
+            if missing_dep is not None:
+                failed_names.add(name)
+                with self._lock:
+                    self._plugins.pop(name, None)
+                dep_exc = PluginDependencyError(
+                    f"plugin {name!r} skipped because required dependency "
+                    f"{missing_dep!r} failed to load",
+                    consumer=name,
+                )
+                self._record_failure(
+                    source=name,
+                    error=dep_exc,
+                    phase="load",
+                    plugin=p,
+                    mode=mode,
+                )
+                continue
+            try:
+                await self._ado_load(p)
+            except Exception as exc:
+                failed_names.add(name)
+                self._record_failure(
+                    source=name,
+                    error=exc,
+                    phase="load",
+                    plugin=p,
+                    mode=mode,
+                    trigger_hook=False,
+                )
+                continue
             if enable:
-                await self._ado_enable(p)
-        return ordered
+                try:
+                    await self._ado_enable(p)
+                except Exception as exc:
+                    failed_names.add(name)
+                    self._hooks_registry.clear_tag(name)
+                    with self._lock:
+                        self._plugins.pop(name, None)
+                    self._record_failure(
+                        source=name,
+                        error=exc,
+                        phase="enable",
+                        plugin=p,
+                        mode=mode,
+                        trigger_hook=False,
+                    )
+                    continue
+            loaded.append(p)
+        return loaded
 
     async def aload_all_from_module(
-        self, module: ModuleType, *, enable: bool = True
+        self,
+        module: ModuleType,
+        *,
+        enable: bool = True,
+        on_error: OnLoadError | None = None,
     ) -> list[Plugin]:
         """Async variant of :meth:`load_all_from_module`."""
-        return await self.aload_all(scan_module(module), enable=enable)
+        mode = self._resolve_error_mode(on_error)
+        try:
+            plugins = scan_module(module)
+        except Exception as exc:
+            if mode == "raise":
+                raise
+            self._record_failure(
+                source=getattr(module, "__name__", repr(module)),
+                error=exc,
+                phase="discovery",
+                plugin=None,
+                mode=mode,
+            )
+            return []
+        return await self.aload_all(plugins, enable=enable, on_error=mode)
 
-    async def aload_entry_points(self, group: str, *, enable: bool = True) -> list[Plugin]:
+    async def aload_entry_points(
+        self,
+        group: str,
+        *,
+        enable: bool = True,
+        on_error: OnLoadError | None = None,
+    ) -> list[Plugin]:
         """Async variant of :meth:`load_entry_points`."""
-        collected: list[Plugin] = []
-        for ep_name, module in iter_entry_points(group):
-            try:
-                collected.extend(scan_module(module))
-            except Exception as exc:
-                raise PluginLoadError(
-                    f"failed to scan entry point {ep_name!r} (group {group!r}): {exc}"
-                ) from exc
-        return await self.aload_all(collected, enable=enable)
+        mode = self._resolve_error_mode(on_error)
+        collected = self._collect_entry_points(group, mode=mode)
+        return await self.aload_all(collected, enable=enable, on_error=mode)
 
     async def aload_directory(
         self,
@@ -321,23 +642,30 @@ class PluginManager:
         recursive: bool = False,
         pattern: str = "*.py",
         enable: bool = True,
+        on_error: OnLoadError | None = None,
     ) -> list[Plugin]:
         """Async variant of :meth:`load_directory`."""
-        collected: list[Plugin] = []
-        for module in iter_directory_modules(path, recursive=recursive, pattern=pattern):
-            collected.extend(scan_module(module))
-        return await self.aload_all(collected, enable=enable)
+        mode = self._resolve_error_mode(on_error)
+        collected = self._collect_directory(
+            path,
+            recursive=recursive,
+            pattern=pattern,
+            mode=mode,
+        )
+        return await self.aload_all(collected, enable=enable, on_error=mode)
 
     # ---------- lifecycle ----------
 
     def enable(self, name: str) -> None:
-        """Transition a DISABLED plugin to ENABLED by re-running its setup."""
+        """Transition a DISABLED, LOADED, or discovered UNLOADED plugin to ENABLED."""
         with self._lock:
             slot = self._require_slot(name)
             if slot.state == PluginState.ENABLED:
                 return
-            if slot.state == PluginState.UNLOADED:
-                raise PluginError(f"plugin {name!r} is unloaded; load() it first")
+            plugin_obj = slot.plugin if slot.state == PluginState.UNLOADED else None
+        if plugin_obj is not None:
+            self.load_all([plugin_obj], enable=True, on_error="raise")
+            return
         self._do_enable(slot.plugin)
 
     def disable(self, name: str, *, cascade: bool = False) -> None:
@@ -350,10 +678,8 @@ class PluginManager:
         """
         with self._lock:
             slot = self._require_slot(name)
-            if slot.state in (PluginState.DISABLED, PluginState.LOADED):
+            if slot.state in (PluginState.DISABLED, PluginState.LOADED, PluginState.UNLOADED):
                 return
-            if slot.state == PluginState.UNLOADED:
-                raise PluginError(f"plugin {name!r} is unloaded; load() it first")
         enabled_dependents = self._enabled_dependents(name)
         if enabled_dependents and not cascade:
             raise PluginDependencyError(
@@ -376,6 +702,9 @@ class PluginManager:
         """
         with self._lock:
             slot = self._require_slot(name)
+            if slot.state == PluginState.UNLOADED:
+                self._plugins.pop(name, None)
+                return
         dependents = self._active_dependents(name)
         if dependents and not cascade:
             raise PluginDependencyError(
@@ -403,6 +732,10 @@ class PluginManager:
         """
         with self._lock:
             slot = self._require_slot(name)
+            if slot.state == PluginState.UNLOADED:
+                raise PluginError(
+                    f"cannot reload unloaded plugin {name!r}; call enable({name!r}) instead"
+                )
             plugin = slot.plugin
         dependents = self._active_dependents(name)
         if dependents and not cascade:
@@ -437,18 +770,18 @@ class PluginManager:
             slot = self._require_slot(name)
             if slot.state == PluginState.ENABLED:
                 return
-            if slot.state == PluginState.UNLOADED:
-                raise PluginError(f"plugin {name!r} is unloaded; load() it first")
+            plugin_obj = slot.plugin if slot.state == PluginState.UNLOADED else None
+        if plugin_obj is not None:
+            await self.aload_all([plugin_obj], enable=True, on_error="raise")
+            return
         await self._ado_enable(slot.plugin)
 
     async def adisable(self, name: str, *, cascade: bool = False) -> None:
         """Async variant of :meth:`disable`."""
         with self._lock:
             slot = self._require_slot(name)
-            if slot.state in (PluginState.DISABLED, PluginState.LOADED):
+            if slot.state in (PluginState.DISABLED, PluginState.LOADED, PluginState.UNLOADED):
                 return
-            if slot.state == PluginState.UNLOADED:
-                raise PluginError(f"plugin {name!r} is unloaded; load() it first")
         enabled_dependents = self._enabled_dependents(name)
         if enabled_dependents and not cascade:
             raise PluginDependencyError(
@@ -465,6 +798,9 @@ class PluginManager:
         """Async variant of :meth:`unload`."""
         with self._lock:
             slot = self._require_slot(name)
+            if slot.state == PluginState.UNLOADED:
+                self._plugins.pop(name, None)
+                return
         dependents = self._active_dependents(name)
         if dependents and not cascade:
             raise PluginDependencyError(
@@ -497,6 +833,10 @@ class PluginManager:
             )
         with self._lock:
             slot = self._require_slot(name)
+            if slot.state == PluginState.UNLOADED:
+                self._plugins.pop(name, None)
+                self._register_discovered([new_plugin], mode="raise")
+                return new_plugin
         closure = self._cascade_closure(name)
         closure_plugins = [self._plugins[n].plugin for n in closure]
         was_enabled = {n: self._plugins[n].state == PluginState.ENABLED for n in closure}
@@ -525,6 +865,10 @@ class PluginManager:
             )
         with self._lock:
             slot = self._require_slot(name)
+            if slot.state == PluginState.UNLOADED:
+                self._plugins.pop(name, None)
+                self._register_discovered([new_plugin], mode="raise")
+                return new_plugin
         closure = self._cascade_closure(name)
         closure_plugins = [self._plugins[n].plugin for n in closure]
         was_enabled = {n: self._plugins[n].state == PluginState.ENABLED for n in closure}
@@ -548,6 +892,10 @@ class PluginManager:
         """Async variant of :meth:`reload`."""
         with self._lock:
             slot = self._require_slot(name)
+            if slot.state == PluginState.UNLOADED:
+                raise PluginError(
+                    f"cannot reload unloaded plugin {name!r}; call aenable({name!r}) instead"
+                )
             plugin = slot.plugin
         dependents = self._active_dependents(name)
         if dependents and not cascade:
@@ -652,20 +1000,257 @@ class PluginManager:
             slot = self._require_slot(name)
             return slot.ctx.tasks
 
+    def plugin_slots(self, name: str) -> tuple[PluginSlotInfo, ...]:
+        """Slot entries owned by ``name`` as :class:`PluginSlotInfo` instances.
+
+        Includes statically declared ``Plugin.slots`` entries (even when
+        ``UNLOADED`` or ``DISABLED``) plus any dynamic entries registered via
+        ``ctx.provide`` while enabled.
+        """
+        with self._lock:
+            slot = self._require_slot(name)
+            return slot.ctx.slots
+
+    def get_slot(
+        self,
+        slot: str,
+        name: str,
+        *,
+        default: Any = _UNSET,
+        auto_enable: bool = False,
+    ) -> Any:
+        """Return the provider registered for ``(slot, name)`` by an enabled plugin.
+
+        When ``auto_enable=True`` and the provider belongs to a discovered
+        (``UNLOADED``), ``LOADED``, or ``DISABLED`` plugin, that plugin is
+        automatically enabled first.
+
+        If no enabled plugin provides ``(slot, name)``, returns ``default``
+        when provided, or raises :class:`PluginSlotNotFoundError`.
+        """
+        with self._lock:
+            for s in self._plugins.values():
+                if s.state != PluginState.ENABLED:
+                    continue
+                for info in s.ctx.slots:
+                    if info.slot == slot and info.name == name:
+                        return info.provider
+
+            candidate_plugin: str | None = None
+            if auto_enable:
+                for p_name, s in self._plugins.items():
+                    if s.state == PluginState.ENABLED:
+                        continue
+                    if any(info.slot == slot and info.name == name for info in s.ctx.slots):
+                        candidate_plugin = p_name
+                        break
+
+        if candidate_plugin is not None:
+            self.enable(candidate_plugin)
+            with self._lock:
+                s = self._plugins.get(candidate_plugin)
+                if s is not None and s.state == PluginState.ENABLED:
+                    for info in s.ctx.slots:
+                        if info.slot == slot and info.name == name:
+                            return info.provider
+
+        if default is not _UNSET:
+            return default
+
+        available = tuple(self.slot_names(slot, include_unloaded=auto_enable))
+        raise PluginSlotNotFoundError(
+            f"no provider named {name!r} in slot {slot!r} (available: {list(available)})",
+            slot=slot,
+            name=name,
+            available=available,
+        )
+
+    async def aget_slot(
+        self,
+        slot: str,
+        name: str,
+        *,
+        default: Any = _UNSET,
+        auto_enable: bool = False,
+    ) -> Any:
+        """Async variant of :meth:`get_slot` (uses :meth:`aenable` when ``auto_enable=True``)."""
+        with self._lock:
+            for s in self._plugins.values():
+                if s.state != PluginState.ENABLED:
+                    continue
+                for info in s.ctx.slots:
+                    if info.slot == slot and info.name == name:
+                        return info.provider
+
+            candidate_plugin: str | None = None
+            if auto_enable:
+                for p_name, s in self._plugins.items():
+                    if s.state == PluginState.ENABLED:
+                        continue
+                    if any(info.slot == slot and info.name == name for info in s.ctx.slots):
+                        candidate_plugin = p_name
+                        break
+
+        if candidate_plugin is not None:
+            await self.aenable(candidate_plugin)
+            with self._lock:
+                s = self._plugins.get(candidate_plugin)
+                if s is not None and s.state == PluginState.ENABLED:
+                    for info in s.ctx.slots:
+                        if info.slot == slot and info.name == name:
+                            return info.provider
+
+        if default is not _UNSET:
+            return default
+
+        available = tuple(self.slot_names(slot, include_unloaded=auto_enable))
+        raise PluginSlotNotFoundError(
+            f"no provider named {name!r} in slot {slot!r} (available: {list(available)})",
+            slot=slot,
+            name=name,
+            available=available,
+        )
+
+    def get_slots(
+        self,
+        slot: str,
+        names: Iterable[str] | None = None,
+        *,
+        auto_enable: bool = False,
+    ) -> dict[str, Any]:
+        """Return ``{name: provider}`` for ``slot``.
+
+        - When ``names`` is given (e.g. ``["dead", "rings"]``), resolves each
+          requested name in order via :meth:`get_slot`, raising
+          :class:`PluginSlotNotFoundError` if any name is missing.
+        - When ``names is None``, returns all providers registered under
+          ``slot`` by enabled plugins (activating discovered/disabled providers
+          first when ``auto_enable=True``).
+        """
+        if names is not None:
+            return {n: self.get_slot(slot, n, auto_enable=auto_enable) for n in names}
+
+        if auto_enable:
+            with self._lock:
+                to_enable = [
+                    p_name
+                    for p_name, s in self._plugins.items()
+                    if s.state != PluginState.ENABLED
+                    and any(info.slot == slot for info in s.ctx.slots)
+                ]
+            for p_name in to_enable:
+                self.enable(p_name)
+
+        out: dict[str, Any] = {}
+        with self._lock:
+            for s in self._plugins.values():
+                if s.state != PluginState.ENABLED:
+                    continue
+                for info in s.ctx.slots:
+                    if info.slot == slot:
+                        out[info.name] = info.provider
+        return out
+
+    async def aget_slots(
+        self,
+        slot: str,
+        names: Iterable[str] | None = None,
+        *,
+        auto_enable: bool = False,
+    ) -> dict[str, Any]:
+        """Async variant of :meth:`get_slots` (uses :meth:`aget_slot` / :meth:`aenable`)."""
+        if names is not None:
+            out_named: dict[str, Any] = {}
+            for n in names:
+                out_named[n] = await self.aget_slot(slot, n, auto_enable=auto_enable)
+            return out_named
+
+        if auto_enable:
+            with self._lock:
+                to_enable = [
+                    p_name
+                    for p_name, s in self._plugins.items()
+                    if s.state != PluginState.ENABLED
+                    and any(info.slot == slot for info in s.ctx.slots)
+                ]
+            for p_name in to_enable:
+                await self.aenable(p_name)
+
+        out: dict[str, Any] = {}
+        with self._lock:
+            for s in self._plugins.values():
+                if s.state != PluginState.ENABLED:
+                    continue
+                for info in s.ctx.slots:
+                    if info.slot == slot:
+                        out[info.name] = info.provider
+        return out
+
+    def slot_names(self, slot: str, *, include_unloaded: bool = True) -> list[str]:
+        """Return sorted provider names registered under ``slot``.
+
+        With ``include_unloaded=True`` (the default), includes declarative
+        slots from discovered (``UNLOADED``) and disabled plugins so CLI
+        introspection works without executing plugin setup code.
+        """
+        names: set[str] = set()
+        with self._lock:
+            for s in self._plugins.values():
+                if not include_unloaded and s.state != PluginState.ENABLED:
+                    continue
+                for info in s.ctx.slots:
+                    if info.slot == slot:
+                        names.add(info.name)
+        return sorted(names)
+
+    def list_slots(
+        self,
+        slot: str | None = None,
+        *,
+        include_unloaded: bool = False,
+    ) -> list[PluginSlotInfo]:
+        """Return :class:`PluginSlotInfo` entries across managed plugins.
+
+        Pass ``slot="fix"`` to filter to a single slot category, or
+        ``include_unloaded=True`` to include entries from ``UNLOADED`` /
+        ``DISABLED`` plugins.
+        """
+        out: list[PluginSlotInfo] = []
+        with self._lock:
+            for s in self._plugins.values():
+                if not include_unloaded and s.state != PluginState.ENABLED:
+                    continue
+                for info in s.ctx.slots:
+                    if slot is None or info.slot == slot:
+                        out.append(info)
+        return out
+
     def list_plugins(self) -> list[PluginInfo]:
         with self._lock:
             slots = list(self._plugins.values())
         out: list[PluginInfo] = []
         for slot in slots:
-            targets = tuple(self.plugin_targets(slot.plugin.manifest.name))
-            tasks = self.plugin_tasks(slot.plugin.manifest.name)
-            out.append(_info_for(slot.plugin, state=slot.state, targets=targets, tasks=tasks))
+            p_name = slot.plugin.manifest.name
+            targets = tuple(self.plugin_targets(p_name))
+            tasks = self.plugin_tasks(p_name)
+            p_slots = self.plugin_slots(p_name)
+            out.append(
+                _info_for(
+                    slot.plugin,
+                    state=slot.state,
+                    targets=targets,
+                    tasks=tasks,
+                    slots=p_slots,
+                )
+            )
         return out
 
     def dump(self) -> dict[str, Any]:
         """Return a structured snapshot — handy for CLIs and debug output."""
         return {
             "registry": self._hooks_registry.name,
+            "host_name": self._host_name,
+            "host_version": self._host_version,
             "plugins": [
                 {
                     "name": info.name,
@@ -673,11 +1258,21 @@ class PluginManager:
                     "state": info.state.value,
                     "requires": list(info.requires),
                     "optional_requires": list(info.optional_requires),
+                    "peer_requires": list(info.peer_requires),
+                    "host_requires": info.host_requires,
                     "conflicts": list(info.conflicts),
                     "description": info.description,
                     "author": info.author,
                     "tags": list(info.tags),
                     "targets": list(info.targets),
+                    "slots": [
+                        {
+                            "slot": s.slot,
+                            "name": s.name,
+                            "metadata": dict(s.metadata),
+                        }
+                        for s in info.slots
+                    ],
                     "tasks": [
                         {
                             "name": getattr(t.task, "name", repr(t.task)),
@@ -689,6 +1284,15 @@ class PluginManager:
                 for info in self.list_plugins()
             ],
             "graph": self.dependency_graph(),
+            "load_errors": [
+                {
+                    "source": err.source,
+                    "phase": err.phase,
+                    "error": str(err.error),
+                    "error_type": type(err.error).__name__,
+                }
+                for err in self.load_errors()
+            ],
         }
 
     def __repr__(self) -> str:
@@ -839,6 +1443,202 @@ class PluginManager:
             raise PluginNotFoundError(f"no plugin named {name!r}")
         return slot
 
+    def _resolve_error_mode(self, on_error: OnLoadError | None) -> OnLoadError:
+        mode = self._on_load_error if on_error is None else on_error
+        if mode not in ("raise", "skip", "warn"):
+            raise ValueError(f"on_error must be 'raise', 'skip', or 'warn', got {mode!r}")
+        return mode
+
+    def _record_failure(
+        self,
+        *,
+        source: str,
+        error: Exception,
+        phase: LoadFailurePhase,
+        plugin: Plugin | None,
+        mode: OnLoadError,
+        trigger_hook: bool = True,
+    ) -> None:
+        failure = PluginLoadFailure(source=source, error=error, phase=phase, plugin=plugin)
+        with self._lock:
+            self._load_errors.append(failure)
+        if trigger_hook:
+            self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, error)
+        if mode == "warn":
+            _logger.warning("pyplugy: skipping %r during %s: %s", source, phase, error)
+
+    def _collect_entry_points(self, group: str, *, mode: OnLoadError) -> list[Plugin]:
+        collected: list[Plugin] = []
+
+        def _on_ep_error(ep_name: str, exc: Exception) -> None:
+            wrapped = PluginLoadError(
+                f"failed to load entry point {ep_name!r} (group {group!r}): {exc}"
+            )
+            wrapped.__cause__ = exc
+            self._record_failure(
+                source=ep_name,
+                error=wrapped,
+                phase="discovery",
+                plugin=None,
+                mode=mode,
+            )
+
+        ep_iter = iter_entry_points(group, on_error=None if mode == "raise" else _on_ep_error)
+        for ep_name, module in ep_iter:
+            try:
+                collected.extend(scan_module(module))
+            except Exception as exc:
+                wrapped = PluginLoadError(
+                    f"failed to scan entry point {ep_name!r} (group {group!r}): {exc}"
+                )
+                wrapped.__cause__ = exc
+                if mode == "raise":
+                    raise wrapped from exc
+                self._record_failure(
+                    source=ep_name,
+                    error=wrapped,
+                    phase="discovery",
+                    plugin=None,
+                    mode=mode,
+                )
+        return collected
+
+    def _collect_directory(
+        self,
+        path: Path,
+        *,
+        recursive: bool,
+        pattern: str,
+        mode: OnLoadError,
+    ) -> list[Plugin]:
+        collected: list[Plugin] = []
+
+        def _on_file_error(file_path: str, exc: Exception) -> None:
+            self._record_failure(
+                source=file_path,
+                error=exc,
+                phase="discovery",
+                plugin=None,
+                mode=mode,
+            )
+
+        mod_iter = iter_directory_modules(
+            path,
+            recursive=recursive,
+            pattern=pattern,
+            on_error=None if mode == "raise" else _on_file_error,
+        )
+        try:
+            for module in mod_iter:
+                try:
+                    collected.extend(scan_module(module))
+                except Exception as exc:
+                    if mode == "raise":
+                        raise
+                    self._record_failure(
+                        source=getattr(module, "__file__", None) or module.__name__,
+                        error=exc,
+                        phase="discovery",
+                        plugin=None,
+                        mode=mode,
+                    )
+        except Exception as exc:
+            if mode == "raise":
+                raise
+            self._record_failure(
+                source=str(path),
+                error=exc,
+                phase="discovery",
+                plugin=None,
+                mode=mode,
+            )
+        return collected
+
+    def _slot_owner(
+        self,
+        slot: str,
+        name: str,
+        *,
+        exclude_plugin: str | None = None,
+    ) -> str | None:
+        with self._lock:
+            for p_name, s in self._plugins.items():
+                if p_name == exclude_plugin:
+                    continue
+                for info in s.ctx.slots:
+                    if info.slot == slot and info.name == name:
+                        return p_name
+        return None
+
+    def _register_discovered(
+        self,
+        plugins: list[Plugin],
+        *,
+        mode: OnLoadError,
+    ) -> list[Plugin]:
+        registered: list[Plugin] = []
+        for p in plugins:
+            name = p.manifest.name
+            try:
+                with self._lock:
+                    if name in self._plugins:
+                        raise PluginAlreadyLoadedError(f"plugin {name!r} is already registered")
+                    check_host_requirement(
+                        p,
+                        host_version=self._host_version,
+                        host_name=self._host_name,
+                    )
+                    for foe in p.manifest.conflicts:
+                        if foe in self._plugins:
+                            raise PluginConflictError(
+                                f"plugin {name!r} conflicts with {foe!r}; cannot register together",
+                                consumer=name,
+                            )
+                    for other_name, other_slot in self._plugins.items():
+                        if name in other_slot.plugin.manifest.conflicts:
+                            raise PluginConflictError(
+                                f"plugin {other_name!r} conflicts with {name!r}; "
+                                "cannot register together",
+                                consumer=name,
+                            )
+                    for slot_name, entries in p.manifest.slots.items():
+                        for entry_name in entries:
+                            owner = self._slot_owner(slot_name, entry_name, exclude_plugin=name)
+                            if owner is not None:
+                                raise PluginSlotConflictError(
+                                    f"slot ({slot_name!r}, {entry_name!r}) is claimed by both "
+                                    f"{owner!r} and {name!r}",
+                                    slot=slot_name,
+                                    name=entry_name,
+                                    existing_plugin=owner,
+                                    new_plugin=name,
+                                )
+                    ctx = self._build_ctx(p)
+                    slot = _Slot(p, ctx)
+                    slot.state = PluginState.UNLOADED
+                    self._plugins[name] = slot
+                registered.append(p)
+            except Exception as exc:
+                if mode == "raise":
+                    raise
+                self._record_failure(
+                    source=name,
+                    error=exc,
+                    phase="plan",
+                    plugin=p,
+                    mode=mode,
+                )
+        return registered
+
+    def _first_failed_dep(self, plugin: Plugin, failed_names: set[str]) -> str | None:
+        if not failed_names:
+            return None
+        for req in (*plugin.manifest.requires, *plugin.manifest.peer_requires):
+            dep_name, _ = parse_requirement(req)
+            if dep_name in failed_names:
+                return dep_name
+        return None
+
     def _coerce_to_plugins(self, target: Any) -> list[Plugin]:
         if isinstance(target, Plugin):
             return [target]
@@ -874,7 +1674,12 @@ class PluginManager:
             "module, list, Path, or dotted/path string"
         )
 
-    def _plan_load(self, plugins: list[Plugin]) -> list[Plugin]:
+    def _plan_load(
+        self,
+        plugins: list[Plugin],
+        *,
+        mode: OnLoadError = "raise",
+    ) -> list[Plugin]:
         """Validate uniqueness, merge with already-loaded plugins, return dep-ordered list.
 
         If a hard dependency is missing and resolvers are registered, this
@@ -882,6 +1687,9 @@ class PluginManager:
         planning. Capped at ``self._resolver_max_rounds`` rounds to surface
         runaway resolvers.
         """
+        if mode != "raise":
+            return self._plan_load_tolerant(plugins, mode=mode)
+
         batch = list(plugins)
         seen_misses: list[str] = []
         for _round in range(self._resolver_max_rounds):
@@ -894,7 +1702,9 @@ class PluginManager:
                 if not extras:
                     raise
                 seen_misses.append(exc.missing)
-                existing = {p.manifest.name for p in batch} | set(self._plugins)
+                existing = {p.manifest.name for p in batch} | {
+                    n for n, s in self._plugins.items() if s.state != PluginState.UNLOADED
+                }
                 added = False
                 for p in extras:
                     if p.manifest.name in existing:
@@ -911,26 +1721,190 @@ class PluginManager:
             f"missing chain: {seen_misses}"
         )
 
+    def _expand_with_unloaded_deps(self, plugins: list[Plugin]) -> list[Plugin]:
+        """Pull in any discovered ``UNLOADED`` plugins needed as hard deps of ``plugins``."""
+        expanded = list(plugins)
+        seen = {p.manifest.name for p in expanded}
+        queue = list(expanded)
+        while queue:
+            current = queue.pop(0)
+            m = current.manifest
+            for req in m.requires:
+                dep_name, _ = parse_requirement(req)
+                if dep_name in seen:
+                    continue
+                slot = self._plugins.get(dep_name)
+                if slot is not None and slot.state == PluginState.UNLOADED:
+                    seen.add(dep_name)
+                    expanded.append(slot.plugin)
+                    queue.append(slot.plugin)
+        return expanded
+
     def _plan_load_once(self, plugins: list[Plugin]) -> list[Plugin]:
         with self._lock:
-            already: set[str] = set(self._plugins.keys())
+            loaded_existing = {
+                n: s.plugin for n, s in self._plugins.items() if s.state != PluginState.UNLOADED
+            }
             seen: set[str] = set()
             for p in plugins:
                 name = p.manifest.name
-                if name in already:
+                if name in loaded_existing:
                     raise PluginAlreadyLoadedError(f"plugin {name!r} is already loaded")
                 if name in seen:
                     raise PluginAlreadyLoadedError(
                         f"plugin {name!r} appears twice in the load batch"
                     )
                 seen.add(name)
+
+            expanded = self._expand_with_unloaded_deps(plugins)
+            expanded_names = {p.manifest.name for p in expanded}
+            # Check slot conflicts against any already-registered plugin (loaded or discovered).
+            for p in expanded:
+                name = p.manifest.name
+                for slot_name, entries in p.manifest.slots.items():
+                    for entry_name in entries:
+                        owner = self._slot_owner(slot_name, entry_name, exclude_plugin=name)
+                        if owner is not None and owner not in expanded_names:
+                            raise PluginSlotConflictError(
+                                f"slot ({slot_name!r}, {entry_name!r}) is claimed by both "
+                                f"{owner!r} and {name!r}",
+                                slot=slot_name,
+                                name=entry_name,
+                                existing_plugin=owner,
+                                new_plugin=name,
+                            )
+
             # Topo-sort considers both new plugins (for cross-deps in the batch)
             # AND already-loaded ones (so a new plugin can depend on an existing one).
-            combined = list(plugins) + [s.plugin for s in self._plugins.values()]
-            ordered_combined = resolve_load_order(combined)
-            # Keep only the new ones, in the resolved order.
-            new_names = {p.manifest.name for p in plugins}
-            return [p for p in ordered_combined if p.manifest.name in new_names]
+            combined = list(expanded) + list(loaded_existing.values())
+            ordered_combined = resolve_load_order(
+                combined,
+                host_version=self._host_version,
+                host_name=self._host_name,
+            )
+            # Keep only the new/promoted ones, in the resolved order.
+            return [p for p in ordered_combined if p.manifest.name in expanded_names]
+
+    def _plan_load_tolerant(
+        self,
+        plugins: list[Plugin],
+        *,
+        mode: OnLoadError,
+    ) -> list[Plugin]:
+        """Fault-tolerant variant of :meth:`_plan_load` for ``on_error='skip'|'warn'``."""
+        with self._lock:
+            loaded_existing = {
+                n: s.plugin for n, s in self._plugins.items() if s.state != PluginState.UNLOADED
+            }
+
+        # 1) Deduplicate and drop already-loaded plugins.
+        batch: list[Plugin] = []
+        seen: set[str] = set()
+        for p in plugins:
+            name = p.manifest.name
+            if name in loaded_existing:
+                err = PluginAlreadyLoadedError(f"plugin {name!r} is already loaded")
+                self._record_failure(source=name, error=err, phase="plan", plugin=p, mode=mode)
+                continue
+            if name in seen:
+                err = PluginAlreadyLoadedError(f"plugin {name!r} appears twice in the load batch")
+                self._record_failure(source=name, error=err, phase="plan", plugin=p, mode=mode)
+                continue
+            seen.add(name)
+            batch.append(p)
+
+        # 2) Iteratively resolve missing deps (via resolvers) or prune bad plugins.
+        tried_resolvers: set[str] = set()
+        resolver_rounds = 0
+        while batch:
+            try:
+                return self._plan_load_once(batch)
+            except PluginMissingDependencyError as exc:
+                if (
+                    self._resolvers
+                    and exc.missing not in tried_resolvers
+                    and resolver_rounds < self._resolver_max_rounds
+                ):
+                    tried_resolvers.add(exc.missing)
+                    resolver_rounds += 1
+                    extras = self._invoke_resolvers(exc.missing)
+                    existing = {p.manifest.name for p in batch} | set(loaded_existing)
+                    added = False
+                    for extra in extras:
+                        if extra.manifest.name not in existing:
+                            batch.append(extra)
+                            existing.add(extra.manifest.name)
+                            added = True
+                    if added:
+                        continue
+                self._prune_offending_plugin(batch, exc, mode=mode)
+            except PluginError as exc:
+                self._prune_offending_plugin(batch, exc, mode=mode)
+        return []
+
+    def _prune_offending_plugin(
+        self,
+        batch: list[Plugin],
+        exc: PluginError,
+        *,
+        mode: OnLoadError,
+    ) -> None:
+        consumer = getattr(exc, "consumer", None)
+        if consumer is not None:
+            for idx, p in enumerate(batch):
+                if p.manifest.name == consumer:
+                    removed = batch.pop(idx)
+                    self._record_failure(
+                        source=consumer,
+                        error=exc,
+                        phase="plan",
+                        plugin=removed,
+                        mode=mode,
+                    )
+                    return
+            # Consumer may be an UNLOADED dep pulled in by _expand_with_unloaded_deps.
+            with self._lock:
+                slot = self._plugins.get(consumer)
+                if slot is not None and slot.state == PluginState.UNLOADED:
+                    self._plugins.pop(consumer, None)
+                    unloaded_plugin = slot.plugin
+                else:
+                    unloaded_plugin = None
+            if unloaded_plugin is not None:
+                self._record_failure(
+                    source=consumer,
+                    error=exc,
+                    phase="plan",
+                    plugin=unloaded_plugin,
+                    mode=mode,
+                )
+                return
+
+        # Fallback (e.g. cyclic dependency): drop all batch members mentioned as a distinct token,
+        # or the last plugin in batch if none matched.
+        msg = str(exc)
+        dropped = False
+        for p in list(batch):
+            pattern = rf"(?:^|[^A-Za-z0-9_.-]){re.escape(p.manifest.name)}(?:[^A-Za-z0-9_.-]|$)"
+            if re.search(pattern, msg):
+                batch.remove(p)
+                self._record_failure(
+                    source=p.manifest.name,
+                    error=exc,
+                    phase="plan",
+                    plugin=p,
+                    mode=mode,
+                )
+                dropped = True
+        if not dropped and batch:
+            removed = batch.pop()
+            self._record_failure(
+                source=removed.manifest.name,
+                error=exc,
+                phase="plan",
+                plugin=removed,
+                mode=mode,
+            )
 
     def _invoke_resolvers(self, missing: str) -> list[Plugin]:
         """Try each registered resolver for ``missing``; first non-empty result wins."""
@@ -1019,6 +1993,22 @@ class PluginManager:
         kwargs = _build_injection_kwargs(plugin, method, ctx)
         return method(ctx, **kwargs)
 
+    @staticmethod
+    def _build_declarative_slot_infos(plugin: Plugin) -> list[PluginSlotInfo]:
+        name = plugin.manifest.name
+        out: list[PluginSlotInfo] = []
+        for slot_name, entries in plugin._declarative_slots.items():
+            for entry_name, provider in entries.items():
+                out.append(
+                    PluginSlotInfo(
+                        slot=slot_name,
+                        name=entry_name,
+                        provider=provider,
+                        plugin=name,
+                    )
+                )
+        return out
+
     def _build_ctx(self, plugin: Plugin) -> PluginContext:
         name = plugin.manifest.name
         # ``setdefault`` guarantees ``ctx.config is self._configs[name]`` —
@@ -1048,6 +2038,8 @@ class PluginManager:
             for key, schema in declared_events.items():
                 target = f"{name}:{key}"
                 ctx._events[key] = HookPoint(target, schema, registry=self._hooks_registry)
+        # Populate declarative slots so they are visible before on_load runs.
+        ctx._slot_infos.extend(self._build_declarative_slot_infos(plugin))
         return ctx
 
     def _wire_scheduled_tasks(self, plugin: Plugin) -> None:
@@ -1117,7 +2109,13 @@ class PluginManager:
 
     def _do_load(self, plugin: Plugin) -> None:
         name = plugin.manifest.name
-        ctx = self._build_ctx(plugin)
+        try:
+            ctx = self._build_ctx(plugin)
+        except Exception as exc:
+            self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
+            with self._lock:
+                self._plugins.pop(name, None)
+            raise
         slot = _Slot(plugin, ctx)
         with self._lock:
             self._plugins[name] = slot
@@ -1132,6 +2130,8 @@ class PluginManager:
                     self._hooks_registry.clear_tag(name)
                     with self._lock:
                         self._plugins.pop(name, None)
+                    if isinstance(exc, PluginSlotConflictError):
+                        raise
                     raise PluginLoadError(f"on_load failed for plugin {name!r}: {exc}") from exc
             slot.state = PluginState.LOADED
             self._hooks_registry.trigger(HOOK_PLUGIN_LOAD, plugin)
@@ -1156,6 +2156,8 @@ class PluginManager:
                     except Exception as exc:
                         self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                         self._hooks_registry.clear_tag(name)
+                        if isinstance(exc, PluginSlotConflictError):
+                            raise
                         raise PluginLoadError(
                             f"re-load failed during enable() for {name!r}: {exc}"
                         ) from exc
@@ -1191,6 +2193,8 @@ class PluginManager:
             _logger.debug("pyplugy: disabled %r — cleared %d hook(s)", name, len(removed))
             self._unwire_scheduled_tasks(plugin)
             slot.ctx._task_infos.clear()
+            slot.ctx._slot_infos.clear()
+            slot.ctx._slot_infos.extend(self._build_declarative_slot_infos(plugin))
             slot.state = PluginState.DISABLED
             self._hooks_registry.trigger(HOOK_PLUGIN_DISABLE, plugin)
         finally:
@@ -1227,7 +2231,13 @@ class PluginManager:
 
     async def _ado_load(self, plugin: Plugin) -> None:
         name = plugin.manifest.name
-        ctx = self._build_ctx(plugin)
+        try:
+            ctx = self._build_ctx(plugin)
+        except Exception as exc:
+            self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
+            with self._lock:
+                self._plugins.pop(name, None)
+            raise
         slot = _Slot(plugin, ctx)
         with self._lock:
             self._plugins[name] = slot
@@ -1241,6 +2251,8 @@ class PluginManager:
                     self._hooks_registry.clear_tag(name)
                     with self._lock:
                         self._plugins.pop(name, None)
+                    if isinstance(exc, PluginSlotConflictError):
+                        raise
                     raise PluginLoadError(f"on_load failed for plugin {name!r}: {exc}") from exc
             slot.state = PluginState.LOADED
             self._hooks_registry.trigger(HOOK_PLUGIN_LOAD, plugin)
@@ -1264,6 +2276,8 @@ class PluginManager:
                     except Exception as exc:
                         self._hooks_registry.trigger(HOOK_PLUGIN_ERROR, plugin, exc)
                         self._hooks_registry.clear_tag(name)
+                        if isinstance(exc, PluginSlotConflictError):
+                            raise
                         raise PluginLoadError(
                             f"re-load failed during enable() for {name!r}: {exc}"
                         ) from exc
@@ -1297,6 +2311,8 @@ class PluginManager:
             _logger.debug("pyplugy: disabled %r — cleared %d hook(s)", name, len(removed))
             self._unwire_scheduled_tasks(plugin)
             slot.ctx._task_infos.clear()
+            slot.ctx._slot_infos.clear()
+            slot.ctx._slot_infos.extend(self._build_declarative_slot_infos(plugin))
             slot.state = PluginState.DISABLED
             self._hooks_registry.trigger(HOOK_PLUGIN_DISABLE, plugin)
         finally:

@@ -30,7 +30,7 @@ from pyplugy._plugin import Plugin
 from pyplugy.exceptions import PluginLoadError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
 
 __all__ = [
@@ -105,7 +105,11 @@ def scan_module(module: ModuleType) -> list[Plugin]:
     return found
 
 
-def iter_entry_points(group: str) -> Iterator[tuple[str, ModuleType]]:
+def iter_entry_points(
+    group: str,
+    *,
+    on_error: Callable[[str, Exception], None] | None = None,
+) -> Iterator[tuple[str, ModuleType]]:
     """Yield ``(entry_point_name, module)`` for every entry point in ``group``.
 
     Each entry point is resolved with :func:`importlib.metadata.entry_points`.
@@ -115,14 +119,20 @@ def iter_entry_points(group: str) -> Iterator[tuple[str, ModuleType]]:
     """
     eps = importlib.metadata.entry_points(group=group)
     for ep in eps:
-        loaded = ep.load()
-        if isinstance(loaded, ModuleType):
-            yield ep.name, loaded
-        else:
-            # ``ep.load()`` may return a class/function — use its parent module.
-            module_name = getattr(loaded, "__module__", None) or ep.value.split(":")[0]
-            module = importlib.import_module(module_name)
-            yield ep.name, module
+        try:
+            loaded = ep.load()
+            if isinstance(loaded, ModuleType):
+                module = loaded
+            else:
+                # ``ep.load()`` may return a class/function — use its parent module.
+                module_name = getattr(loaded, "__module__", None) or ep.value.split(":")[0]
+                module = importlib.import_module(module_name)
+        except Exception as exc:
+            if on_error is None:
+                raise
+            on_error(ep.name, exc)
+            continue
+        yield ep.name, module
 
 
 def _sandbox_name(stem: str, *, counter: dict[str, int]) -> str:
@@ -161,6 +171,7 @@ def iter_directory_modules(
     *,
     recursive: bool = False,
     pattern: str = "*.py",
+    on_error: Callable[[str, Exception], None] | None = None,
 ) -> Iterable[ModuleType]:
     """Yield modules imported from every file matching ``pattern`` under ``path``."""
     if not path.exists():
@@ -175,4 +186,11 @@ def iter_directory_modules(
             continue
         if file.name == "__init__.py":
             continue
-        yield import_file(file, sandbox_counter=sandbox_counter)
+        try:
+            module = import_file(file, sandbox_counter=sandbox_counter)
+        except Exception as exc:
+            if on_error is None:
+                raise
+            on_error(str(file), exc)
+            continue
+        yield module

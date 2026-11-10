@@ -10,6 +10,9 @@ from pyplugy._manager import (
     HOOK_PLUGIN_ERROR,
     HOOK_PLUGIN_LOAD,
     HOOK_PLUGIN_UNLOAD,
+    LoadFailurePhase,
+    OnLoadError,
+    PluginLoadFailure,
     PluginManager,
     current_manager,
 )
@@ -20,6 +23,7 @@ from pyplugy._plugin import (
     PluginState,
     plugin,
 )
+from pyplugy._slot_info import PluginSlotInfo
 from pyplugy._task_info import PluginTaskInfo
 from pyplugy.exceptions import (
     PluginAlreadyLoadedError,
@@ -27,11 +31,14 @@ from pyplugy.exceptions import (
     PluginConflictError,
     PluginDependencyError,
     PluginError,
+    PluginHostVersionError,
     PluginLoadError,
     PluginManifestError,
     PluginMissingDependencyError,
     PluginNotFoundError,
     PluginPeerDependencyError,
+    PluginSlotConflictError,
+    PluginSlotNotFoundError,
     PluginUnloadError,
 )
 
@@ -42,6 +49,8 @@ __all__ = [
     "HOOK_PLUGIN_ERROR",
     "HOOK_PLUGIN_LOAD",
     "HOOK_PLUGIN_UNLOAD",
+    "LoadFailurePhase",
+    "OnLoadError",
     "Plugin",
     "PluginAlreadyLoadedError",
     "PluginConfigValidationError",
@@ -49,20 +58,26 @@ __all__ = [
     "PluginContext",
     "PluginDependencyError",
     "PluginError",
+    "PluginHostVersionError",
     "PluginInfo",
     "PluginLoadError",
+    "PluginLoadFailure",
     "PluginManager",
     "PluginManifest",
     "PluginManifestError",
     "PluginMissingDependencyError",
     "PluginNotFoundError",
     "PluginPeerDependencyError",
+    "PluginSlotConflictError",
+    "PluginSlotInfo",
+    "PluginSlotNotFoundError",
     "PluginState",
     "PluginTaskInfo",
     "PluginUnloadError",
+    "__version__",
     "current_context",
     "current_manager",
     "plugin",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"

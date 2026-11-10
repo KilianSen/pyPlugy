@@ -16,11 +16,12 @@ the decorator is a thin façade around the class form.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar, overload
 
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from pyplugy.exceptions import PluginManifestError
 
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from pyplugy._context import PluginContext
+    from pyplugy._slot_info import PluginSlotInfo
     from pyplugy._task_info import PluginTaskInfo
 
 
@@ -69,9 +71,16 @@ class PluginManifest(BaseModel):
     directories) deliberately skip it. Use this when the host owns the
     dependency's lifecycle and shouldn't have it auto-pulled.
 
+    ``host_requires`` is an optional PEP 440 specifier (e.g. ``">=1.0,<2.0"``
+    or ``"vrs>=1.0,<2.0"``) checked against the manager's ``host_version``
+    and ``host_name``.
+
     ``conflicts`` is a tuple of plain plugin names — planning refuses
     to load a plugin alongside any name it lists in ``conflicts`` (and
     symmetrically refuses if a loaded plugin lists the new one).
+
+    ``slots`` maps slot category names to the provider names declared by
+    the plugin (e.g. ``{"hair": ("v2",), "fix": ("dead", "rings")}``).
 
     The model is ``frozen`` and ``extra="forbid"`` — unknown fields are
     a manifest error, surfaced via :class:`PluginManifestError`.
@@ -84,10 +93,12 @@ class PluginManifest(BaseModel):
     requires: tuple[str, ...] = ()
     optional_requires: tuple[str, ...] = ()
     peer_requires: tuple[str, ...] = ()
+    host_requires: str = ""
     conflicts: tuple[str, ...] = ()
     description: str = ""
     author: str = ""
     tags: tuple[str, ...] = ()
+    slots: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
     @field_validator("name")
     @classmethod
@@ -112,6 +123,48 @@ class PluginManifest(BaseModel):
                 raise ValueError(str(exc)) from exc
         return v
 
+    @field_validator("host_requires")
+    @classmethod
+    def _validate_host_requires(cls, v: str) -> str:
+        if not v:
+            return ""
+        from pyplugy._depgraph import parse_host_requirement
+        from pyplugy.exceptions import PluginDependencyError
+
+        try:
+            parse_host_requirement(v)
+        except PluginDependencyError as exc:
+            raise ValueError(str(exc)) from exc
+        return v
+
+    @field_validator("slots", mode="before")
+    @classmethod
+    def _validate_slots(cls, v: Any) -> dict[str, tuple[str, ...]]:
+        if v is None:
+            return {}
+        if not isinstance(v, Mapping):
+            raise ValueError("slots must be a mapping of slot_name -> provider names or mapping")
+        out: dict[str, tuple[str, ...]] = {}
+        for slot_name, entries in v.items():
+            if not isinstance(slot_name, str) or not slot_name:
+                raise ValueError(f"slot name must be a non-empty string, got {slot_name!r}")
+            if isinstance(entries, Mapping):
+                names = tuple(entries.keys())
+            elif isinstance(entries, Iterable) and not isinstance(entries, (str, bytes)):
+                names = tuple(entries)
+            else:
+                raise ValueError(
+                    f"slot {slot_name!r} entries must be a mapping or iterable of names"
+                )
+            for entry_name in names:
+                if not isinstance(entry_name, str) or not entry_name:
+                    raise ValueError(
+                        f"provider name in slot {slot_name!r} must be a non-empty string, "
+                        f"got {entry_name!r}"
+                    )
+            out[slot_name] = names
+        return out
+
 
 @dataclass(frozen=True, slots=True)
 class PluginInfo:
@@ -129,6 +182,8 @@ class PluginInfo:
     tags: tuple[str, ...]
     targets: tuple[str, ...]
     tasks: tuple[PluginTaskInfo, ...]
+    host_requires: str = ""
+    slots: tuple[PluginSlotInfo, ...] = ()
 
 
 _NAME_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
@@ -151,6 +206,42 @@ def _derive_plugin_name(class_name: str) -> str:
     return _NAME_BOUNDARY_RE.sub("_", class_name).lower()
 
 
+def _normalize_declarative_slots(
+    plugin_name: str,
+    raw_slots: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Validate and copy a declarative ``{slot: {name: provider}}`` mapping."""
+    if not raw_slots:
+        return {}
+    if not isinstance(raw_slots, Mapping):
+        raise PluginManifestError(
+            f"invalid manifest for {plugin_name!r}: slots must be a mapping of "
+            f"{{slot: {{name: provider}}}}, got {type(raw_slots).__name__}"
+        )
+    normalized: dict[str, dict[str, Any]] = {}
+    for slot_name, entries in raw_slots.items():
+        if not isinstance(slot_name, str) or not slot_name:
+            raise PluginManifestError(
+                f"invalid manifest for {plugin_name!r}: slot name must be a non-empty string, "
+                f"got {slot_name!r}"
+            )
+        if not isinstance(entries, Mapping):
+            raise PluginManifestError(
+                f"invalid manifest for {plugin_name!r}: slot {slot_name!r} must map "
+                f"provider names to providers, got {type(entries).__name__}"
+            )
+        slot_dict: dict[str, Any] = {}
+        for entry_name, provider in entries.items():
+            if not isinstance(entry_name, str) or not entry_name:
+                raise PluginManifestError(
+                    f"invalid manifest for {plugin_name!r}: provider name in slot "
+                    f"{slot_name!r} must be a non-empty string, got {entry_name!r}"
+                )
+            slot_dict[entry_name] = provider
+        normalized[slot_name] = slot_dict
+    return normalized
+
+
 def _coerce_manifest(
     name: str,
     *,
@@ -158,10 +249,12 @@ def _coerce_manifest(
     requires: tuple[str, ...] | list[str] | None = None,
     optional_requires: tuple[str, ...] | list[str] | None = None,
     peer_requires: tuple[str, ...] | list[str] | None = None,
+    host_requires: str = "",
     conflicts: tuple[str, ...] | list[str] | None = None,
     description: str = "",
     author: str = "",
     tags: tuple[str, ...] | list[str] | None = None,
+    slots: Mapping[str, Any] | None = None,
 ) -> PluginManifest:
     if not isinstance(name, str) or not name:
         raise PluginManifestError(f"plugin name must be a non-empty string, got {name!r}")
@@ -172,10 +265,12 @@ def _coerce_manifest(
             requires=tuple(requires or ()),
             optional_requires=tuple(optional_requires or ()),
             peer_requires=tuple(peer_requires or ()),
+            host_requires=host_requires,
             conflicts=tuple(conflicts or ()),
             description=description,
             author=author,
             tags=tuple(tags or ()),
+            slots=dict(slots or {}),
         )
     except ValidationError as exc:
         raise PluginManifestError(f"invalid manifest for {name!r}: {exc}") from exc
@@ -207,6 +302,7 @@ class Plugin:
     requires: ClassVar[tuple[str, ...] | list[str]] = ()
     optional_requires: ClassVar[tuple[str, ...] | list[str]] = ()
     peer_requires: ClassVar[tuple[str, ...] | list[str]] = ()
+    host_requires: ClassVar[str] = ""
     conflicts: ClassVar[tuple[str, ...] | list[str]] = ()
     description: ClassVar[str] = ""
     author: ClassVar[str] = ""
@@ -226,29 +322,51 @@ class Plugin:
     # underlying registry. Optional — empty by default.
     events: ClassVar[dict[str, Any]] = {}
 
-    def __init__(self, manifest: PluginManifest | None = None) -> None:
+    # Named slot providers declared statically at class scope:
+    # ``{"hair": {"v2": v2_mesher}, "fix": {"dead": fix_dead}}``.
+    # Inspectable even while the plugin is UNLOADED.
+    slots: ClassVar[Mapping[str, Mapping[str, Any]]] = {}
+
+    def __init__(
+        self,
+        manifest: PluginManifest | None = None,
+        *,
+        declarative_slots: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        raw_slots = declarative_slots if declarative_slots is not None else self.slots
         if manifest is None:
             # When the subclass didn't set ``name``, derive one from the
             # class name (PascalCase → snake_case). This is a pure
             # ergonomic shortcut; ``_DecoratedPlugin`` passes its own
             # name in directly and never hits this branch.
             derived = self.name or _derive_plugin_name(type(self).__name__)
+            normalized_slots = _normalize_declarative_slots(derived, raw_slots)
             manifest = _coerce_manifest(
                 derived,
                 version=self.version,
                 requires=tuple(self.requires),
                 optional_requires=tuple(self.optional_requires),
                 peer_requires=tuple(self.peer_requires),
+                host_requires=self.host_requires,
                 conflicts=tuple(self.conflicts),
                 description=self.description,
                 author=self.author,
                 tags=tuple(self.tags),
+                slots={s: tuple(entries.keys()) for s, entries in normalized_slots.items()},
             )
+        else:
+            normalized_slots = _normalize_declarative_slots(manifest.name, raw_slots)
         self._manifest = manifest
+        self._declarative_slots: dict[str, dict[str, Any]] = normalized_slots
 
     @property
     def manifest(self) -> PluginManifest:
         return self._manifest
+
+    @property
+    def declarative_slots(self) -> dict[str, dict[str, Any]]:
+        """Copy of the statically declared ``{slot: {name: provider}}`` mapping."""
+        return {s: dict(entries) for s, entries in self._declarative_slots.items()}
 
     # ---------- lifecycle hooks (override in subclasses) ----------
     #
@@ -258,19 +376,19 @@ class Plugin:
     # use the async variants (``aload``/``aenable``/``adisable``/``aunload``)
     # to drive plugins whose lifecycle is async.
 
-    def on_load(self, ctx: PluginContext) -> None | Awaitable[None]:
+    def on_load(self, ctx: PluginContext) -> Awaitable[None] | None:
         """Register hooks/tasks. Called inside a ``tag_scope(self.manifest.name)`` block."""
 
-    def on_unload(self, ctx: PluginContext) -> None | Awaitable[None]:
+    def on_unload(self, ctx: PluginContext) -> Awaitable[None] | None:
         """Release external resources.
 
         Hooks/tasks owned by the plugin are torn down by the manager.
         """
 
-    def on_enable(self, ctx: PluginContext) -> None | Awaitable[None]:
+    def on_enable(self, ctx: PluginContext) -> Awaitable[None] | None:
         """Called when the plugin transitions DISABLED → ENABLED."""
 
-    def on_disable(self, ctx: PluginContext) -> None | Awaitable[None]:
+    def on_disable(self, ctx: PluginContext) -> Awaitable[None] | None:
         """Called when the plugin transitions ENABLED → DISABLED."""
 
     def __repr__(self) -> str:
@@ -283,12 +401,18 @@ class _DecoratedPlugin(Plugin):
 
     __slots__ = ("_setup",)
 
-    def __init__(self, manifest: PluginManifest, setup: Callable[[PluginContext], None]) -> None:
-        super().__init__(manifest)
+    def __init__(
+        self,
+        manifest: PluginManifest,
+        setup: Callable[[PluginContext], None],
+        *,
+        declarative_slots: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(manifest, declarative_slots=declarative_slots)
         self._setup = setup
 
-    def on_load(self, ctx: PluginContext) -> None:
-        self._setup(ctx)
+    def on_load(self, ctx: PluginContext) -> Any:
+        return self._setup(ctx)
 
 
 @overload
@@ -301,10 +425,12 @@ def plugin(
     requires: tuple[str, ...] | list[str] | None = ...,
     optional_requires: tuple[str, ...] | list[str] | None = ...,
     peer_requires: tuple[str, ...] | list[str] | None = ...,
+    host_requires: str = ...,
     conflicts: tuple[str, ...] | list[str] | None = ...,
     description: str = ...,
     author: str = ...,
     tags: tuple[str, ...] | list[str] | None = ...,
+    slots: Mapping[str, Mapping[str, Any]] | None = ...,
 ) -> Callable[[Callable[..., None]], Plugin]: ...
 def plugin(
     name: str | Callable[[PluginContext], None],
@@ -313,10 +439,12 @@ def plugin(
     requires: tuple[str, ...] | list[str] | None = None,
     optional_requires: tuple[str, ...] | list[str] | None = None,
     peer_requires: tuple[str, ...] | list[str] | None = None,
+    host_requires: str = "",
     conflicts: tuple[str, ...] | list[str] | None = None,
     description: str = "",
     author: str = "",
     tags: tuple[str, ...] | list[str] | None = None,
+    slots: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> Plugin | Callable[[Callable[[PluginContext], None]], Plugin]:
     """Wrap a ``setup(ctx)`` callable into a :class:`Plugin`.
 
@@ -340,18 +468,21 @@ def plugin(
         resolved_name = (
             inferred_name if inferred_name is not None else (name if isinstance(name, str) else "")
         )
+        normalized_slots = _normalize_declarative_slots(resolved_name, slots)
         manifest = _coerce_manifest(
             resolved_name,
             version=version,
             requires=requires,
             optional_requires=optional_requires,
             peer_requires=peer_requires,
+            host_requires=host_requires,
             conflicts=conflicts,
             description=description,
             author=author,
             tags=tags,
+            slots={s: tuple(entries.keys()) for s, entries in normalized_slots.items()},
         )
-        return _DecoratedPlugin(manifest, setup)
+        return _DecoratedPlugin(manifest, setup, declarative_slots=normalized_slots)
 
     if callable(name) and not isinstance(name, str):
         fn = name
@@ -369,6 +500,7 @@ def _info_for(
     state: PluginState,
     targets: tuple[str, ...],
     tasks: tuple[PluginTaskInfo, ...],
+    slots: tuple[PluginSlotInfo, ...] = (),
 ) -> PluginInfo:
     m = plugin_obj.manifest
     return PluginInfo(
@@ -384,4 +516,6 @@ def _info_for(
         tags=m.tags,
         targets=targets,
         tasks=tasks,
+        host_requires=m.host_requires,
+        slots=slots,
     )

@@ -86,6 +86,9 @@ The `PluginContext` handed to your setup / lifecycle methods exposes:
 | `ctx.dep(name)` / `ctx.depends_on(name)`    | The dep's `PluginContext` (must be declared in requires)             |
 | `ctx.api_of(name)`                          | Whatever the dep last `export`-ed                                    |
 | `ctx.export(obj)`                           | Publish this plugin's API for dependents (validated vs `api_model`)  |
+| `ctx.provide(slot, name, provider)`         | Register a named provider into a `(slot, name)` lookup entry         |
+| `ctx.slot(slot, name=...)`                  | Alias / decorator form of `ctx.provide`                              |
+| `ctx.slots`                                 | `tuple[PluginSlotInfo, ...]` registered by this plugin               |
 | `ctx.logger`                                | `logging.Logger` named `pyplugy.<plugin-name>`                       |
 
 Every hook registered inside `on_load` is auto-tagged with the plugin's name
@@ -111,6 +114,40 @@ manager.load(MyPlugin())
 manager.load(some_module)
 manager.load("my_app.plugins.audit")        # dotted path
 manager.load(Path("./extra/audit.py"))      # .py file
+```
+
+### Non-executing discovery (`discover_*`)
+
+To inspect installed plugins, their manifests, or their declarative `slots`
+without running `on_load` / setup code, use the `discover*` family. Discovered
+plugins are registered in `PluginState.UNLOADED` and promoted on demand via
+`manager.enable(name)` or `manager.get_slot(..., auto_enable=True)`:
+
+```python
+manager.discover_entry_points("myapp.plugins", on_error="skip")
+manager.discover_directory(Path("./plugins"), on_error="skip")
+manager.discover(MyPlugin)
+
+for info in manager.list_plugins():
+    print(info.name, info.state, info.slots)   # UNLOADED — no setup code ran
+
+manager.enable("my_plugin")                    # resolves deps, runs on_load → ENABLED
+```
+
+### Fault-tolerant loading (`on_error`)
+
+Batch loaders and discovery helpers accept `on_error="raise" | "skip" | "warn"`
+(or set a manager-wide default via `PluginManager(on_load_error="skip")`).
+When `"skip"` or `"warn"` is active, broken plugins (import errors, bad
+manifests, missing dependencies, host version mismatches, slot conflicts, or
+`on_load` exceptions) are isolated and recorded rather than aborting the batch:
+
+```python
+manager = PluginManager(on_load_error="skip")
+manager.load_directory(Path("./plugins"))
+
+for failure in manager.load_errors():
+    print(failure.source, failure.phase, failure.error)
 ```
 
 ## Lifecycle
@@ -246,9 +283,77 @@ On load, the manager performs a topological sort:
 
 - Missing hard dep → `PluginMissingDependencyError` (carries `missing` + `consumer`)
 - Missing peer dep → `PluginPeerDependencyError`
+- Host version mismatch → `PluginHostVersionError`
+- Declarative slot collision → `PluginSlotConflictError`
 - Specifier mismatch → `PluginDependencyError`
 - Cycle → `PluginDependencyError`
 - Conflict → `PluginConflictError`
+
+### Host API version gating (`host_requires`)
+
+Plugins can declare compatibility with the host application via PEP 440
+specifiers (either bare `">=1.0,<2.0"` or named `"vrs>=1.0,<2.0"`):
+
+```python
+class HairV2(Plugin):
+    version = "0.1.0"
+    host_requires = "vrs>=1.0,<2.0"
+
+manager = PluginManager(host_name="vrs", host_version="1.4.0")
+manager.load(HairV2)
+```
+
+If `PluginManager(host_version=None)` (the default), `host_requires` is not
+enforced. When `host_version` is set, incompatible plugins raise
+`PluginHostVersionError` during planning (or are skipped when
+`on_error="skip"` / `"warn"`).
+
+## Named slots (provider lookup)
+
+While hooks broadcast an event to every listener, **slots** map
+`(slot, name) → single provider` so the host can ask *"which providers exist
+for slot `fix`?"* or *"give me the `hair` provider named `v2`"*.
+
+Plugins can declare slots statically on the class / decorator (inspectable even
+when `UNLOADED`) or register them dynamically inside `on_load`:
+
+```python
+class V2HairPlugin(Plugin):
+    name = "hair_v2"
+    slots = {
+        "hair": {"v2": build_v2_hair},
+        "fix": {"dead": fix_dead, "rings": fix_rings},
+    }
+
+@plugin("extra_fixes", slots={"fix": {"layers": None}})
+def extra_fixes(ctx: PluginContext) -> None:
+    @ctx.slot("fix", "layers", metadata={"description": "Fix layer ordering"})
+    def fix_layers(mesh):
+        ...
+```
+
+Host lookup (both sync and async variants are available):
+
+```python
+# List registered provider names for a slot and full slot metadata (including UNLOADED plugins)
+manager.slot_names("fix", include_unloaded=True)           # ["dead", "layers", "rings"]
+manager.list_slots("fix", include_unloaded=True)           # [PluginSlotInfo(...), ...]
+
+# Resolve one provider by (slot, name) — auto-enables UNLOADED plugins if needed
+mesher = manager.get_slot("hair", "v2", auto_enable=True)
+mesher_or_fallback = manager.get_slot("hair", "custom", default=default_mesher)
+
+# Resolve multiple named providers in caller-specified order (e.g. --fix dead,rings)
+fixes = manager.get_slots("fix", ["dead", "rings"], auto_enable=True)
+
+# Async equivalents for async plugins (when auto_enable=True)
+mesher = await manager.aget_slot("hair", "v2", auto_enable=True)
+fixes = await manager.aget_slots("fix", ["dead", "rings"], auto_enable=True)
+```
+
+At most one active plugin may own a given `(slot, name)` pair; collisions raise
+`PluginSlotConflictError`. When a plugin is disabled or unloaded, its dynamic
+slots are automatically removed.
 
 ### Auto-resolving missing deps
 
@@ -538,7 +643,10 @@ for info in manager.plugin_tasks("reactive"):
 | `PluginDependencyError`          | Specifier mismatch, cycle, blocked cascade, generic dep failure             |
 | `PluginMissingDependencyError`   | Hard `requires` entry missing (carries `missing` + `consumer`)              |
 | `PluginPeerDependencyError`      | `peer_requires` entry missing — host must supply, resolvers won't help      |
+| `PluginHostVersionError`         | `host_requires` incompatible with `PluginManager(host_version=...)`         |
 | `PluginConflictError`            | `conflicts` entry collides with another loaded or about-to-load plugin       |
+| `PluginSlotConflictError`        | Two plugins register the same `(slot, name)` provider                       |
+| `PluginSlotNotFoundError`        | `get_slot` / `get_slots` requested an unknown `(slot, name)`                |
 | `PluginConfigValidationError`    | `ctx.config` fails its `config_model` (load or `update_config`)             |
 | `PluginLoadError`                | `on_load` / `on_enable` / decorator setup raised                            |
 | `PluginUnloadError`              | `on_unload` raised                                                          |

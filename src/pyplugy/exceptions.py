@@ -13,11 +13,14 @@ __all__ = [
     "PluginConflictError",
     "PluginDependencyError",
     "PluginError",
+    "PluginHostVersionError",
     "PluginLoadError",
     "PluginManifestError",
     "PluginMissingDependencyError",
     "PluginNotFoundError",
     "PluginPeerDependencyError",
+    "PluginSlotConflictError",
+    "PluginSlotNotFoundError",
     "PluginUnloadError",
 ]
 
@@ -30,12 +33,42 @@ class PluginNotFoundError(PluginError):
     """Raised when a manager lookup references a name that is not registered."""
 
 
+class PluginSlotNotFoundError(PluginNotFoundError):
+    """Raised when a requested ``(slot, name)`` provider is not registered.
+
+    Carries :attr:`slot`, :attr:`name`, and :attr:`available` (the sorted tuple
+    of registered provider names in ``slot``) so CLI hosts can format helpful
+    diagnostics without parsing the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        slot: str,
+        name: str,
+        available: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.slot = slot
+        self.name = name
+        self.available = available
+
+
 class PluginAlreadyLoadedError(PluginError):
     """Raised when loading a plugin whose ``name`` is already managed."""
 
 
 class PluginDependencyError(PluginError):
     """Raised on missing dependency, version mismatch, or cyclic dependency graph."""
+
+    def __init__(self, message: str, *, consumer: str | None = None) -> None:
+        super().__init__(message)
+        self.consumer = consumer
+
+
+class PluginHostVersionError(PluginDependencyError):
+    """Raised when a plugin's ``host_requires`` specifier is not satisfied by the host."""
 
 
 class PluginMissingDependencyError(PluginDependencyError):
@@ -47,13 +80,35 @@ class PluginMissingDependencyError(PluginDependencyError):
     """
 
     def __init__(self, message: str, *, missing: str, consumer: str) -> None:
-        super().__init__(message)
+        super().__init__(message, consumer=consumer)
         self.missing = missing
-        self.consumer = consumer
 
 
 class PluginConflictError(PluginDependencyError):
     """Raised when two plugins declare mutually exclusive ``conflicts`` entries."""
+
+
+class PluginLoadError(PluginError):
+    """Raised when ``on_load`` (or decorator setup) raises during load."""
+
+
+class PluginSlotConflictError(PluginConflictError, PluginLoadError):
+    """Raised when two plugins attempt to register the same ``(slot, name)`` provider."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        slot: str,
+        name: str,
+        existing_plugin: str,
+        new_plugin: str,
+    ) -> None:
+        super().__init__(message, consumer=new_plugin)
+        self.slot = slot
+        self.name = name
+        self.existing_plugin = existing_plugin
+        self.new_plugin = new_plugin
 
 
 class PluginPeerDependencyError(PluginDependencyError):
@@ -67,10 +122,6 @@ class PluginPeerDependencyError(PluginDependencyError):
 
 class PluginConfigValidationError(PluginError):
     """Raised when a plugin's config dict fails its ``config_model`` schema."""
-
-
-class PluginLoadError(PluginError):
-    """Raised when ``on_load`` (or decorator setup) raises during load."""
 
 
 class PluginUnloadError(PluginError):
